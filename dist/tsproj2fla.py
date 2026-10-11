@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """tsproj2fla - convert ToonSquid (.tsproj) projects to Adobe Animate (.fla).
 
-Single-file build. Requires only: lz4, Pillow.
+Single-file build, version 0.2.1. Requires only: lz4, Pillow.
 
 Usage:
     python tsproj2fla.py INPUT.tsproj [-o OUTPUT.fla] [--list]
+    python tsproj2fla.py --version
 """
 
 from __future__ import annotations
@@ -105,6 +106,10 @@ from typing import Any
 
 
 
+# sqlite3.Connection.deserialize landed in Python 3.11; older runtimes fall back
+# to writing the database to a temporary file.
+_HAS_DESERIALIZE = hasattr(sqlite3.Connection, "deserialize")
+
 
 @dataclass
 class Clip:
@@ -145,15 +150,51 @@ class Project:
         return [self.clips[s] for s in self.scene_ids if s in self.clips]
 
 
-def _load_sqlite(data: bytes) -> sqlite3.Connection:
+@dataclass
+class _SqliteHandle:
+    """A SQLite connection plus the temp file backing it (if any).
+
+    ``sqlite3.Connection`` allows neither attribute assignment nor weak
+    references, so the temp path is carried alongside the connection instead of
+    on it.
+    """
+
+    conn: sqlite3.Connection
+    tmp_path: str | None = None
+
+    def close(self) -> None:
+        self.conn.close()
+        if self.tmp_path:
+            try:
+                Path(self.tmp_path).unlink(missing_ok=True)
+            except OSError:  # pragma: no cover - let the OS reap it
+                pass
+
+
+def _load_sqlite(data: bytes) -> _SqliteHandle:
+    """Open an in-memory SQLite database from raw file bytes.
+
+    Uses :meth:`sqlite3.Connection.deserialize` when available (Python 3.11+),
+    which avoids touching the filesystem entirely. Older Pythons fall back to a
+    temporary file.
+
+    On Windows a temp file stays locked until its connection is closed, so the
+    old code's "delete before close" raised ``PermissionError``; the caller must
+    now release the handle via :meth:`_SqliteHandle.close`.
+    """
+    if _HAS_DESERIALIZE:
+        conn = sqlite3.connect(":memory:")
+        conn.deserialize(data)
+        return _SqliteHandle(conn)
+
     tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
     try:
         tmp.write(data)
         tmp.close()
-        conn = sqlite3.connect(tmp.name)
-        return conn
-    finally:
+        return _SqliteHandle(sqlite3.connect(tmp.name), tmp_path=tmp.name)
+    except Exception:
         Path(tmp.name).unlink(missing_ok=True)
+        raise
 
 
 def _json_blob(value: bytes | str) -> dict[str, Any]:
@@ -200,63 +241,62 @@ def _read_clip(conn: sqlite3.Connection, clip_id: str, is_scene: bool) -> Clip:
 
 def load_project(path: str | Path) -> Project:
     path = Path(path)
-    zf = zipfile.ZipFile(path)
-    names = zf.namelist()
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
 
-    root = next((n.split("/", 1)[0] for n in names if n.endswith("/data")), None)
-    if root is None:
-        raise ValueError("not a ToonSquid project: missing '<uuid>/data'")
+        root = next((n.split("/", 1)[0] for n in names if n.endswith("/data")), None)
+        if root is None:
+            raise ValueError("not a ToonSquid project: missing '<uuid>/data'")
 
-    data_conn = _load_sqlite(zf.read(f"{root}/data"))
+        data_conn = _load_sqlite(zf.read(f"{root}/data"))
 
-    meta = {}
-    for key, value in data_conn.execute("SELECT key, value FROM meta_d"):
-        if key == "me":
-            meta = _json_blob(value)
+        meta = {}
+        for key, value in data_conn.conn.execute("SELECT key, value FROM meta_d"):
+            if key == "me":
+                meta = _json_blob(value)
 
-    scene_ids = [sid for sid, _ in data_conn.execute('SELECT id, "index" FROM scenes ORDER BY "index"')]
-    all_clip_ids = [cid for (cid,) in data_conn.execute("SELECT id FROM res_anim_clips")]
-    audio_ids = [aid for (aid,) in data_conn.execute("SELECT id FROM res_audio_clips")]
-    data_conn.close()
+        scene_ids = [sid for sid, _ in data_conn.conn.execute('SELECT id, "index" FROM scenes ORDER BY "index"')]
+        all_clip_ids = [cid for (cid,) in data_conn.conn.execute("SELECT id FROM res_anim_clips")]
+        audio_ids = [aid for (aid,) in data_conn.conn.execute("SELECT id FROM res_audio_clips")]
+        data_conn.close()
 
-    resolution = meta.get("re") or {}
-    project = Project(
-        path=path,
-        id=root,
-        name=meta.get("na") or path.stem,
-        width=int(resolution.get("w") or 0),
-        height=int(resolution.get("h") or 0),
-        fps=int(meta.get("fr") or 24),
-        scene_ids=scene_ids,
-    )
+        resolution = meta.get("re") or {}
+        project = Project(
+            path=path,
+            id=root,
+            name=meta.get("na") or path.stem,
+            width=int(resolution.get("w") or 0),
+            height=int(resolution.get("h") or 0),
+            fps=int(meta.get("fr") or 24),
+            scene_ids=scene_ids,
+        )
 
-    scene_set = set(scene_ids)
-    for cid in all_clip_ids:
-        member = f"{root}/Animations/{cid}.tsanim"
-        if member not in names:
-            continue
-        conn = _load_sqlite(zf.read(member))
-        clip = _read_clip(conn, cid, is_scene=cid in scene_set)
-        conn.close()
-        project.clips[cid] = clip
+        scene_set = set(scene_ids)
+        for cid in all_clip_ids:
+            member = f"{root}/Animations/{cid}.tsanim"
+            if member not in names:
+                continue
+            conn = _load_sqlite(zf.read(member))
+            project.clips[cid] = _read_clip(conn.conn, cid, is_scene=cid in scene_set)
+            conn.close()
 
-    for member in names:
-        if member.startswith(f"{root}/Textures/") and not member.endswith("/"):
-            tid = member.rsplit("/", 1)[-1]
-            try:
-                project.textures[tid] = decode_dvtx(zf.read(member))
-            except Exception as exc:  # pragma: no cover - defensive
-                project.warnings.append(f"texture {tid}: {exc}")
+        for member in names:
+            if member.startswith(f"{root}/Textures/") and not member.endswith("/"):
+                tid = member.rsplit("/", 1)[-1]
+                try:
+                    project.textures[tid] = decode_dvtx(zf.read(member))
+                except Exception as exc:  # pragma: no cover - defensive
+                    project.warnings.append(f"texture {tid}: {exc}")
 
-    for aid in audio_ids:
-        member = f"{root}/Audio/{aid}"
-        if member not in names:
-            continue
-        info = _json_blob(zf.read(member))
-        wav = None
-        if f"{member}.wav" in names:
-            wav = zf.read(f"{member}.wav")
-        project.audio[aid] = {"info": info, "wav": wav}
+        for aid in audio_ids:
+            member = f"{root}/Audio/{aid}"
+            if member not in names:
+                continue
+            info = _json_blob(zf.read(member))
+            wav = None
+            if f"{member}.wav" in names:
+                wav = zf.read(f"{member}.wav")
+            project.audio[aid] = {"info": info, "wav": wav}
 
     return project
 
@@ -286,13 +326,10 @@ documented approximations.
 
 import io
 import math
-import sqlite3
-import tempfile
 import time
 import uuid
 import zipfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import quoteattr
 
@@ -454,11 +491,11 @@ def _path_subpaths(key_value: Any) -> list[dict[str, Any]]:
     return [key_value]
 
 
-def _edges_for_subpath_format_a(subpath: dict[str, Any]) -> str:
+def _edges_for_subpath_format_a(subpath: dict[str, Any], force_close: bool = False) -> str:
     points = subpath.get("cp") or []
     if not points:
         return ""
-    closed = bool(subpath.get("cl"))
+    closed = bool(subpath.get("cl")) or force_close
     out: list[str] = []
 
     def pos(point: dict[str, Any]) -> tuple[float, float]:
@@ -485,39 +522,73 @@ def _edges_for_subpath_format_a(subpath: dict[str, Any]) -> str:
     return "".join(out)
 
 
-def _edges_for_subpath_format_b(subpath: dict[str, Any]) -> str:
+def _flatten_cubic(
+    p0: tuple[float, float],
+    c1: tuple[float, float],
+    c2: tuple[float, float],
+    p3: tuple[float, float],
+    tolerance: float = 0.15,
+    max_segments: int = 32,
+) -> list[tuple[float, float]]:
+    """Approximate a cubic Bezier as line-to points (excluding ``p0``).
+
+    XFL's ``edges`` attribute has no cubic command, so cubics are flattened into
+    a polyline. The segment count follows the control-polygon length, which
+    keeps gentle curves cheap and tight curves smooth.
+    """
+    def dist(a, b):
+        return math.hypot(b[0] - a[0], b[1] - a[1])
+
+    control_len = dist(p0, c1) + dist(c1, c2) + dist(c2, p3)
+    count = max(1, min(max_segments, int(control_len / max(tolerance, 1e-6)) + 1))
+
+    points = []
+    for step in range(1, count + 1):
+        t = step / count
+        u = 1 - t
+        x = u * u * u * p0[0] + 3 * u * u * t * c1[0] + 3 * u * t * t * c2[0] + t * t * t * p3[0]
+        y = u * u * u * p0[1] + 3 * u * u * t * c1[1] + 3 * u * t * t * c2[1] + t * t * t * p3[1]
+        points.append((x, y))
+    return points
+
+
+def _edges_for_subpath_format_b(subpath: dict[str, Any], force_close: bool = False) -> str:
     points = subpath.get("p") or []
     if not points:
         return ""
-    closed = bool(subpath.get("c"))
-    out: list[str] = []
+    closed = bool(subpath.get("c")) or force_close
     n = len(points)
     first = points[0]["p"]
-    out.append(f"!{_fmt(first[0] * TWIPS)} {_fmt(first[1] * TWIPS)}")
-    segments = n - 1 if not closed else n
+    out = [f"!{_fmt(first[0] * TWIPS)} {_fmt(first[1] * TWIPS)}"]
+    segments = n if closed else n - 1
     for k in range(segments):
         a = points[k]
         b = points[(k + 1) % n]
-        c1 = [a["p"][0] + a.get("o", [0, 0])[0], a["p"][1] + a.get("o", [0, 0])[1]]
-        c2 = [b["p"][0] + b.get("i", [0, 0])[0], b["p"][1] + b.get("i", [0, 0])[1]]
-        e = b["p"]
-        out.append(
-            f"(;{_fmt(c1[0]*TWIPS)},{_fmt(c1[1]*TWIPS)} "
-            f"{_fmt(c2[0]*TWIPS)},{_fmt(c2[1]*TWIPS)} "
-            f"{_fmt(e[0]*TWIPS)},{_fmt(e[1]*TWIPS)});"
-        )
+        p0 = (a["p"][0], a["p"][1])
+        p3 = (b["p"][0], b["p"][1])
+        o = a.get("o") or [0, 0]
+        i = b.get("i") or [0, 0]
+        c1 = (p0[0] + o[0], p0[1] + o[1])
+        c2 = (p3[0] + i[0], p3[1] + i[1])
+        for x, y in _flatten_cubic(p0, c1, c2, p3):
+            out.append(f"|{_fmt(x * TWIPS)} {_fmt(y * TWIPS)}")
     return "".join(out)
 
 
-def path_to_edges(key_value: Any) -> str:
-    """Convert a ToonSquid path keyframe value into an XFL edges string."""
+def path_to_edges(key_value: Any, force_close: bool = False) -> str:
+    """Convert a ToonSquid path keyframe value into an XFL edges string.
+
+    ``force_close`` closes every contour; XFL fills an open contour as if it were
+    closed anyway, but its own shape builder expects the closing segment to be
+    present, so filled paths must be explicitly closed.
+    """
     subpaths = _path_subpaths(key_value)
     parts = []
     for sub in subpaths:
         if "cp" in sub:
-            parts.append(_edges_for_subpath_format_a(sub))
+            parts.append(_edges_for_subpath_format_a(sub, force_close))
         elif "p" in sub:
-            parts.append(_edges_for_subpath_format_b(sub))
+            parts.append(_edges_for_subpath_format_b(sub, force_close))
     return "".join(p for p in parts if p)
 
 
@@ -565,10 +636,6 @@ def build_vector_element(layer_json: dict[str, Any], frame: int) -> str:
     matrix, _pivot = transform_matrix(layer_json, frame)
     # ToonSquid paths are in absolute canvas coordinates; the layer transform
     # (which already folds in the pivot) places them, so no pivot subtraction.
-    edges = path_to_edges(key_value)
-    if not edges:
-        return ""
-
     fill = _solid_color_value(layer_json.get("fC"), frame)
     stroke_color = _solid_color_value(layer_json.get("sC"), frame)
     width = eval_track(layer_json.get("sW"), frame, 0.0)
@@ -576,6 +643,10 @@ def build_vector_element(layer_json: dict[str, Any], frame: int) -> str:
         fill = None
     if stroke_color and (stroke_color[1] <= 0 or width <= 0):
         stroke_color = None
+
+    edges = path_to_edges(key_value, force_close=fill is not None)
+    if not edges:
+        return ""
 
     fills_xml = ""
     if fill:
@@ -596,8 +667,8 @@ def build_vector_element(layer_json: dict[str, Any], frame: int) -> str:
             f"</SolidStroke></StrokeStyle></strokes>"
         )
 
-    fill_attr = ' fillStyle1="1"' if fill else ' fillStyle0="0" fillStyle1="0"'
-    stroke_attr = ' strokeStyle="1"' if (stroke_color and width > 0) else ' strokeStyle="0"'
+    fill_attr = ' fillStyle1="1"' if fill else ""
+    stroke_attr = ' strokeStyle="1"' if (stroke_color and width > 0) else ""
     return (
         "<DOMShape>"
         f"{fills_xml}{strokes_xml}"
@@ -658,11 +729,20 @@ class Converter:
     _symbol_stack: list[str] = field(default_factory=list)
     _item_counter: int = 0
     _bitmap_names: dict[str, str] = field(default_factory=dict)
+    _item_ids: dict[str, str] = field(default_factory=dict)
 
     # -- helpers ---------------------------------------------------------- #
-    def new_item_id(self) -> str:
-        self._item_counter += 1
-        return f"{uuid.uuid4().hex[:8]}-{self._item_counter:08x}"
+    def item_id(self, key: str) -> str:
+        """Stable library itemID for a given key.
+
+        The <Include> in DOMDocument.xml and the DOMSymbolItem/DOMBitmapItem
+        must carry the *same* itemID or Animate cannot resolve the library
+        item, and the document opens with an empty stage.
+        """
+        if key not in self._item_ids:
+            self._item_counter += 1
+            self._item_ids[key] = f"{uuid.uuid4().hex[:8]}-{self._item_counter:08x}"
+        return self._item_ids[key]
 
     def bitmap_name(self, texture_id: str) -> str:
         if texture_id not in self._bitmap_names:
@@ -728,24 +808,27 @@ class Converter:
         )
 
     # -- animation layer -> DOMLayer ------------------------------------- #
-    def _layer_spans(self, layer_id: str) -> list[tuple[int, str]]:
+    def _layer_spans(self, layer_id: str) -> list[tuple[int, int, str]]:
+        """Return ``(start_index, duration, elements)`` spans for a layer."""
         assert self.current_clip is not None
         layer_json = self.current_clip.layers.get(layer_id, {})
         ltype = self.current_clip.layer_type(layer_id)
+        total = max(self.current_clip.total_frames, 1)
 
         if ltype in (LT_SYMBOL, LT_VECTOR, LT_PIXEL, LT_TEXT, LT_SHAPE):
-            return [(0, self.drawing_layer_element(layer_id, 0))]
+            return [(0, total, self.drawing_layer_element(layer_id, 0))]
 
-        spans: list[tuple[int, str]] = []
+        spans: list[tuple[int, int, str]] = []
         for drawing_id in layer_json.get("dr", []):
             drawing = self.current_clip.drawings.get(drawing_id)
             if not drawing:
                 continue
             start = max(int(drawing.get("s", 1)) - 1, 0)
+            end = max(int(drawing.get("e", start + 1)), start + 1)
             parts = [self.drawing_layer_element(child, start) for child in drawing.get("ly", [])]
-            spans.append((start, "".join(p for p in parts if p)))
+            spans.append((start, end - start, "".join(p for p in parts if p)))
         if not spans:
-            spans = [(0, "")]
+            spans = [(0, total, "")]
         spans.sort(key=lambda s: s[0])
         return spans
 
@@ -761,9 +844,18 @@ class Converter:
             return ""
         current = ' current="true" isSelected="true"' if color_index == 0 else ""
         frames = []
-        for start, elements in spans:
+        cursor = 0
+        for start, duration, elements in spans:
+            start = max(start, cursor)
+            if start > cursor:
+                # XFL layers must be contiguous from frame 0; hold the previous
+                # drawing across the gap.
+                frames.append(f'<DOMFrame index="{cursor}" duration="{start - cursor}" keyMode="9728"><elements/></DOMFrame>')
             body = f"<elements>{elements}</elements>" if elements else "<elements/>"
-            frames.append(f'<DOMFrame index="{start}" keyMode="9728">{body}</DOMFrame>')
+            frames.append(
+                f'<DOMFrame index="{start}" duration="{max(duration, 1)}" keyMode="9728">{body}</DOMFrame>'
+            )
+            cursor = start + max(duration, 1)
         return (
             f'<DOMLayer name={quoteattr(name)} color="{self.layer_color(color_index)}"{current}>'
             f"<frames>{''.join(frames)}</frames>"
@@ -818,7 +910,7 @@ class Converter:
             self._symbol_stack.pop()
         return (
             '<DOMSymbolItem xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
-            f'xmlns="{XFL_NS}" name={quoteattr(name)} itemID="{self.new_item_id()}" '
+            f'xmlns="{XFL_NS}" name={quoteattr(name)} itemID="{self.item_id("sym:" + clip_id)}" '
             'symbolType="movie clip">'
             f"<timeline>{timeline}</timeline>"
             "</DOMSymbolItem>"
@@ -827,22 +919,18 @@ class Converter:
 
 def build_texture_map(project: Project) -> dict[str, tuple[str, tuple[int, int, int, int]]]:
     """Map drawing-layer id -> (texture id, destination rect (x, y, w, h))."""
-    zf = zipfile.ZipFile(project.path)
-    tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
-    tmp.write(zf.read(f"{project.id}/data"))
-    tmp.close()
-    conn = sqlite3.connect(tmp.name)
+    with zipfile.ZipFile(project.path) as zf:
+        handle = _load_sqlite(zf.read(f"{project.id}/data"))
     try:
         mapping = {}
-        for owner, _otype, texture_id, _w, _h, x, y, w, h in conn.execute(
+        for owner, _otype, texture_id, _w, _h, x, y, w, h in handle.conn.execute(
             "SELECT ownerId, ownerType, textureId, width, height, x, y, w, h "
             "FROM res_shared_textures"
         ):
             mapping[owner] = (texture_id, (int(x), int(y), int(w), int(h)))
         return mapping
     finally:
-        conn.close()
-        Path(tmp.name).unlink(missing_ok=True)
+        handle.close()
 
 
 def collect_symbols(converter: Converter) -> None:
@@ -884,7 +972,7 @@ def convert(project: Project, reverse_layers: bool = True) -> tuple[bytes, list[
         name = converter.bitmap_name(texture_id)
         w, h, _ = project.textures[texture_id]
         media_xml.append(
-            f'<DOMBitmapItem name={quoteattr(name)} itemID="{converter.new_item_id()}" '
+            f'<DOMBitmapItem name={quoteattr(name)} itemID="{converter.item_id("bmp:" + texture_id)}" '
             'allowSmoothing="true" useImportedJPEGData="false" compressionType="lossless" '
             'originalCompressionType="lossless" quality="50" '
             f'href={quoteattr(name + ".png")} bitmapDataHRef={quoteattr("M " + name + " 0.dat")} '
@@ -893,7 +981,7 @@ def convert(project: Project, reverse_layers: bool = True) -> tuple[bytes, list[
 
     symbols_xml = [
         f'<Include href={quoteattr(converter.symbol_name(cid) + ".xml")} '
-        f'itemID="{converter.new_item_id()}"/>'
+        f'itemID="{converter.item_id("sym:" + cid)}"/>'
         for cid in converter.referenced_clips()
     ]
 
@@ -913,7 +1001,15 @@ def convert(project: Project, reverse_layers: bool = True) -> tuple[bytes, list[
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("mimetype", "application/vnd.adobe.fla")
+        # The FLA/XFL container, like EPUB/ODF, requires "mimetype" to be the
+        # first entry and stored uncompressed so the format is detectable from
+        # the raw bytes. Animate validates this and opens a blank document if
+        # the entry is deflated.
+        zf.writestr(
+            zipfile.ZipInfo("mimetype"),
+            "application/vnd.adobe.fla",
+            compress_type=zipfile.ZIP_STORED,
+        )
         zf.writestr(f"{project.name}.xfl", "PROXY-CS5")
         zf.writestr("DOMDocument.xml", dom)
         zf.writestr("PublishSettings.xml", _publish_settings(width, height, fps))
@@ -927,14 +1023,76 @@ def convert(project: Project, reverse_layers: bool = True) -> tuple[bytes, list[
             if texture_id not in project.textures:
                 continue
             w, h, raw = project.textures[texture_id]
+            name = converter.bitmap_name(texture_id)
+            # LIBRARY/*.png is the preview bitmap Animate shows; bin/M *.dat is
+            # the actual bitmap data, stored as an uncompressed pixel plane.
             img = Image.frombytes("RGBA", (w, h), raw)
             png = io.BytesIO()
             img.save(png, format="PNG")
-            name = converter.bitmap_name(texture_id)
             zf.writestr(f"LIBRARY/{name}.png", png.getvalue())
-            zf.writestr(f"bin/M {name} 0.dat", png.getvalue())
+            zf.writestr(
+                zipfile.ZipInfo(f"bin/M {name} 0.dat"),
+                _encode_dat_bitmap(w, h, raw),
+                compress_type=zipfile.ZIP_STORED,
+            )
 
     return buf.getvalue(), converter.warnings
+
+
+def _encode_dat_bitmap(width: int, height: int, rgba: bytes) -> bytes:
+    """Encode raw RGBA pixels as an Animate ``.dat`` lossless bitmap.
+
+    Layout (little-endian), matching JPEXS' LosslessImageBinDataReader:
+      magic 0x03 0x05 (32-bit), rowSize = width*4, width, height, 16 reserved
+      bytes, hasAlpha, variant (0 = verbatim pixel plane), then pixels.
+    Pixels are stored as A,R,G,B with colour premultiplied by alpha, using the
+    reader's ``a-1`` pairing (so stored alpha is ``a+1`` for partial alpha).
+    """
+    header = bytearray(26)
+    header[0] = 0x03
+    header[1] = 0x05
+    header[2:4] = (width * 4).to_bytes(2, "little")
+    header[4:6] = width.to_bytes(2, "little")
+    header[6:8] = height.to_bytes(2, "little")
+    header[24] = 1  # hasAlpha
+    header[25] = 0  # variant 0: verbatim A,R,G,B pixel plane
+
+    out = bytearray(len(rgba))
+    for i in range(0, len(rgba), 4):
+        r, g, b, a = rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]
+        if a == 0:
+            sr = sg = sb = sa = 0
+        elif a == 255:
+            sr, sg, sb, sa = r, g, b, 255
+        else:
+            sa = a + 1
+            sr = (r * a) // 256
+            sg = (g * a) // 256
+            sb = (b * a) // 256
+        out[i], out[i + 1], out[i + 2], out[i + 3] = sa, sr, sg, sb
+    return bytes(header) + bytes(out)
+
+
+def _decode_dat_bitmap(data: bytes) -> tuple[int, int, bytes]:
+    """Decode a variant-0 ``.dat`` bitmap back to RGBA (for tests)."""
+    assert data[0] == 0x03 and data[1] == 0x05
+    width = int.from_bytes(data[4:6], "little")
+    height = int.from_bytes(data[6:8], "little")
+    pixels = data[26:26 + width * height * 4]
+    out = bytearray(len(pixels))
+    for i in range(0, len(pixels), 4):
+        sa, sr, sg, sb = pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]
+        if sa == 0:
+            out[i + 3] = 0
+        elif sa == 255:
+            out[i], out[i + 1], out[i + 2], out[i + 3] = sr, sg, sb, 255
+        else:
+            a = sa - 1
+            out[i] = min(255, (sr * 256) // a) if a else 0
+            out[i + 1] = min(255, (sg * 256) // a) if a else 0
+            out[i + 2] = min(255, (sb * 256) // a) if a else 0
+            out[i + 3] = a
+    return width, height, bytes(out)
 
 
 def _publish_settings(width: int, height: int, fps: int) -> str:
@@ -979,13 +1137,15 @@ from pathlib import Path
 
 
 
+__version__ = "0.2.1"
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="tsproj2fla",
         description="Convert a ToonSquid .tsproj project into an Adobe Animate .fla file.",
     )
-    parser.add_argument("input", type=Path, help="path to the .tsproj file")
+    parser.add_argument("input", type=Path, nargs="?", help="path to the .tsproj file")
     parser.add_argument(
         "-o", "--output", type=Path, default=None,
         help="output .fla path (default: alongside the input, same stem)",
@@ -998,7 +1158,13 @@ def main(argv: list[str] | None = None) -> int:
         "--list", action="store_true",
         help="only print a summary of the project and exit",
     )
+    parser.add_argument(
+        "--version", action="version", version=f"tsproj2fla {__version__}",
+    )
     args = parser.parse_args(argv)
+
+    if args.input is None:
+        parser.error("the following arguments are required: input")
 
     if not args.input.exists():
         parser.error(f"input file not found: {args.input}")

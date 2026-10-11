@@ -25,6 +25,10 @@ from typing import Any
 
 from .dvtx import decode_dvtx
 
+# sqlite3.Connection.deserialize landed in Python 3.11; older runtimes fall back
+# to writing the database to a temporary file.
+_HAS_DESERIALIZE = hasattr(sqlite3.Connection, "deserialize")
+
 
 @dataclass
 class Clip:
@@ -65,15 +69,51 @@ class Project:
         return [self.clips[s] for s in self.scene_ids if s in self.clips]
 
 
-def _load_sqlite(data: bytes) -> sqlite3.Connection:
+@dataclass
+class _SqliteHandle:
+    """A SQLite connection plus the temp file backing it (if any).
+
+    ``sqlite3.Connection`` allows neither attribute assignment nor weak
+    references, so the temp path is carried alongside the connection instead of
+    on it.
+    """
+
+    conn: sqlite3.Connection
+    tmp_path: str | None = None
+
+    def close(self) -> None:
+        self.conn.close()
+        if self.tmp_path:
+            try:
+                Path(self.tmp_path).unlink(missing_ok=True)
+            except OSError:  # pragma: no cover - let the OS reap it
+                pass
+
+
+def _load_sqlite(data: bytes) -> _SqliteHandle:
+    """Open an in-memory SQLite database from raw file bytes.
+
+    Uses :meth:`sqlite3.Connection.deserialize` when available (Python 3.11+),
+    which avoids touching the filesystem entirely. Older Pythons fall back to a
+    temporary file.
+
+    On Windows a temp file stays locked until its connection is closed, so the
+    old code's "delete before close" raised ``PermissionError``; the caller must
+    now release the handle via :meth:`_SqliteHandle.close`.
+    """
+    if _HAS_DESERIALIZE:
+        conn = sqlite3.connect(":memory:")
+        conn.deserialize(data)
+        return _SqliteHandle(conn)
+
     tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
     try:
         tmp.write(data)
         tmp.close()
-        conn = sqlite3.connect(tmp.name)
-        return conn
-    finally:
+        return _SqliteHandle(sqlite3.connect(tmp.name), tmp_path=tmp.name)
+    except Exception:
         Path(tmp.name).unlink(missing_ok=True)
+        raise
 
 
 def _json_blob(value: bytes | str) -> dict[str, Any]:
@@ -120,62 +160,61 @@ def _read_clip(conn: sqlite3.Connection, clip_id: str, is_scene: bool) -> Clip:
 
 def load_project(path: str | Path) -> Project:
     path = Path(path)
-    zf = zipfile.ZipFile(path)
-    names = zf.namelist()
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
 
-    root = next((n.split("/", 1)[0] for n in names if n.endswith("/data")), None)
-    if root is None:
-        raise ValueError("not a ToonSquid project: missing '<uuid>/data'")
+        root = next((n.split("/", 1)[0] for n in names if n.endswith("/data")), None)
+        if root is None:
+            raise ValueError("not a ToonSquid project: missing '<uuid>/data'")
 
-    data_conn = _load_sqlite(zf.read(f"{root}/data"))
+        data_conn = _load_sqlite(zf.read(f"{root}/data"))
 
-    meta = {}
-    for key, value in data_conn.execute("SELECT key, value FROM meta_d"):
-        if key == "me":
-            meta = _json_blob(value)
+        meta = {}
+        for key, value in data_conn.conn.execute("SELECT key, value FROM meta_d"):
+            if key == "me":
+                meta = _json_blob(value)
 
-    scene_ids = [sid for sid, _ in data_conn.execute('SELECT id, "index" FROM scenes ORDER BY "index"')]
-    all_clip_ids = [cid for (cid,) in data_conn.execute("SELECT id FROM res_anim_clips")]
-    audio_ids = [aid for (aid,) in data_conn.execute("SELECT id FROM res_audio_clips")]
-    data_conn.close()
+        scene_ids = [sid for sid, _ in data_conn.conn.execute('SELECT id, "index" FROM scenes ORDER BY "index"')]
+        all_clip_ids = [cid for (cid,) in data_conn.conn.execute("SELECT id FROM res_anim_clips")]
+        audio_ids = [aid for (aid,) in data_conn.conn.execute("SELECT id FROM res_audio_clips")]
+        data_conn.close()
 
-    resolution = meta.get("re") or {}
-    project = Project(
-        path=path,
-        id=root,
-        name=meta.get("na") or path.stem,
-        width=int(resolution.get("w") or 0),
-        height=int(resolution.get("h") or 0),
-        fps=int(meta.get("fr") or 24),
-        scene_ids=scene_ids,
-    )
+        resolution = meta.get("re") or {}
+        project = Project(
+            path=path,
+            id=root,
+            name=meta.get("na") or path.stem,
+            width=int(resolution.get("w") or 0),
+            height=int(resolution.get("h") or 0),
+            fps=int(meta.get("fr") or 24),
+            scene_ids=scene_ids,
+        )
 
-    scene_set = set(scene_ids)
-    for cid in all_clip_ids:
-        member = f"{root}/Animations/{cid}.tsanim"
-        if member not in names:
-            continue
-        conn = _load_sqlite(zf.read(member))
-        clip = _read_clip(conn, cid, is_scene=cid in scene_set)
-        conn.close()
-        project.clips[cid] = clip
+        scene_set = set(scene_ids)
+        for cid in all_clip_ids:
+            member = f"{root}/Animations/{cid}.tsanim"
+            if member not in names:
+                continue
+            conn = _load_sqlite(zf.read(member))
+            project.clips[cid] = _read_clip(conn.conn, cid, is_scene=cid in scene_set)
+            conn.close()
 
-    for member in names:
-        if member.startswith(f"{root}/Textures/") and not member.endswith("/"):
-            tid = member.rsplit("/", 1)[-1]
-            try:
-                project.textures[tid] = decode_dvtx(zf.read(member))
-            except Exception as exc:  # pragma: no cover - defensive
-                project.warnings.append(f"texture {tid}: {exc}")
+        for member in names:
+            if member.startswith(f"{root}/Textures/") and not member.endswith("/"):
+                tid = member.rsplit("/", 1)[-1]
+                try:
+                    project.textures[tid] = decode_dvtx(zf.read(member))
+                except Exception as exc:  # pragma: no cover - defensive
+                    project.warnings.append(f"texture {tid}: {exc}")
 
-    for aid in audio_ids:
-        member = f"{root}/Audio/{aid}"
-        if member not in names:
-            continue
-        info = _json_blob(zf.read(member))
-        wav = None
-        if f"{member}.wav" in names:
-            wav = zf.read(f"{member}.wav")
-        project.audio[aid] = {"info": info, "wav": wav}
+        for aid in audio_ids:
+            member = f"{root}/Audio/{aid}"
+            if member not in names:
+                continue
+            info = _json_blob(zf.read(member))
+            wav = None
+            if f"{member}.wav" in names:
+                wav = zf.read(f"{member}.wav")
+            project.audio[aid] = {"info": info, "wav": wav}
 
     return project

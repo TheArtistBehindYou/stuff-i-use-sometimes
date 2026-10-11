@@ -24,10 +24,11 @@ PACKAGE = ROOT / "tsproj2fla"
 HEADER = '''#!/usr/bin/env python3
 """tsproj2fla - convert ToonSquid (.tsproj) projects to Adobe Animate (.fla).
 
-Single-file build. Requires only: lz4, Pillow.
+Single-file build, version {version}. Requires only: lz4, Pillow.
 
 Usage:
     python tsproj2fla.py INPUT.tsproj [-o OUTPUT.fla] [--list]
+    python tsproj2fla.py --version
 """
 '''
 
@@ -48,7 +49,7 @@ def _strip_relative_imports(source: str) -> str:
 
 
 def build_single_file() -> Path:
-    parts = [HEADER, "from __future__ import annotations\n"]
+    parts = [HEADER.format(version=_version()), "from __future__ import annotations\n"]
     for name in MODULE_ORDER:
         src = (PACKAGE / f"{name}.py").read_text()
         parts.append(f"\n# ===== tsproj2fla.{name} =====\n")
@@ -69,7 +70,12 @@ def build_source_zip() -> Path:
         "tsproj2fla/dvtx.py",
         "tsproj2fla/tsproj.py",
         "tests/test_tsproj2fla.py",
+        "launchers/convert-to-fla.sh",
+        "launchers/Convert-to-FLA.command",
+        "launchers/Convert-to-FLA.bat",
         "tools/build_dist.py",
+        "tools/build_exe.py",
+        ".github/workflows/build-exe.yml",
         "pyproject.toml",
         "requirements.txt",
         "README.md",

@@ -4,4 +4,4 @@ from .converter import convert
 from .tsproj import load_project
 
 __all__ = ["convert", "load_project"]
-__version__ = "0.1.0"
+__version__ = "0.2.1"

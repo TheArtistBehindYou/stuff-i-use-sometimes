@@ -1,0 +1,51 @@
+name: build-exe
+
+# Build standalone tsproj2fla executables for Windows, macOS and Linux.
+# Run manually from the Actions tab, or automatically on a version tag.
+#
+# The Windows .exe must be built on Windows (PyInstaller cannot cross-compile),
+# which is exactly what the windows-latest runner here does.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: tsproj2fla-windows
+          - os: macos-latest
+            artifact: tsproj2fla-macos
+          - os: ubuntu-latest
+            artifact: tsproj2fla-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pillow lz4 pyinstaller
+
+      - name: Build executable
+        run: python tools/build_exe.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/tsproj2fla.exe
+            dist/tsproj2fla
+          if-no-files-found: ignore

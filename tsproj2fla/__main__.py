@@ -8,13 +8,15 @@ from pathlib import Path
 from .converter import convert
 from .tsproj import load_project
 
+__version__ = "0.2.1"
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="tsproj2fla",
         description="Convert a ToonSquid .tsproj project into an Adobe Animate .fla file.",
     )
-    parser.add_argument("input", type=Path, help="path to the .tsproj file")
+    parser.add_argument("input", type=Path, nargs="?", help="path to the .tsproj file")
     parser.add_argument(
         "-o", "--output", type=Path, default=None,
         help="output .fla path (default: alongside the input, same stem)",
@@ -27,7 +29,13 @@ def main(argv: list[str] | None = None) -> int:
         "--list", action="store_true",
         help="only print a summary of the project and exit",
     )
+    parser.add_argument(
+        "--version", action="version", version=f"tsproj2fla {__version__}",
+    )
     args = parser.parse_args(argv)
+
+    if args.input is None:
+        parser.error("the following arguments are required: input")
 
     if not args.input.exists():
         parser.error(f"input file not found: {args.input}")

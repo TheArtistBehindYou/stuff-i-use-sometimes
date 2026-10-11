@@ -38,6 +38,47 @@ python dist/tsproj2fla.py MyProject.tsproj -o Out.fla
 
 Rebuild these artifacts at any time with `python tools/build_dist.py`.
 
+### Drag and drop (no command line)
+
+If you'd rather not use a terminal, use a launcher from [`launchers/`](launchers/):
+
+| Your OS | File | How |
+| --- | --- | --- |
+| Windows | `launchers/Convert-to-FLA.bat` | Drag your `.tsproj` onto it |
+| macOS | `launchers/Convert-to-FLA.command` | Drag your `.tsproj` onto it |
+| Linux | `launchers/convert-to-fla.sh` | Drag your `.tsproj` onto it (file-manager action) |
+
+Each launcher converts every dropped file and keeps the window open so you can
+read the result. They find `tsproj2fla.py` next to themselves, then in `dist/`,
+then fall back to an installed `tsproj2fla` command — so either download the
+single-file script next to the launcher, or install the wheel. You can also drop
+several `.tsproj` files at once.
+
+> macOS may require `chmod +x Convert-to-FLA.command` the first time, and
+> Gatekeeper may need a right-click → Open to allow it. Linux file managers
+> vary; the `.sh` also works fine from a terminal.
+
+On **Windows**, the launcher installs the two required libraries (Pillow and
+lz4) automatically on first run, so you never have to run `pip` yourself.
+
+### Standalone executable (nothing to install)
+
+To run with no Python and no dependencies at all, build a single-file
+executable that bundles everything:
+
+```bash
+pip install pyinstaller pillow lz4
+python tools/build_exe.py          # -> dist/tsproj2fla.exe  (Windows)
+```
+
+This must be run **on the target OS** — PyInstaller cannot build a Windows
+`.exe` from macOS or Linux. A GitHub Actions workflow
+([`.github/workflows/build-exe.yml`](.github/workflows/build-exe.yml)) does it
+for you: go to the repo's **Actions → build-exe → Run workflow**, or push a
+`v*` tag, and download the Windows/macOS/Linux executables from the run's
+artifacts.
+
+
 ## Usage
 
 ```bash

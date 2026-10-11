@@ -195,8 +195,118 @@ def test_path_to_edges_format_b_cubic():
         {"p": [10, 0], "o": [0, 0], "i": [-1, 0]},
     ]}]}
     edges = path_to_edges(value)
+    # XFL's edges attribute has no cubic command, so cubics become polylines.
     assert edges.startswith("!0 0")
-    assert "(;" in edges and ");" in edges
+    assert "(;" not in edges
+    assert edges.count("|") > 1
+    assert edges.endswith("|200 0")  # 10px * 20 twips, endpoint preserved
+
+
+def test_path_to_edges_force_close():
+    value = {"s": [{"c": False, "p": [
+        {"p": [0, 0], "o": [0, 0], "i": [0, 0]},
+        {"p": [10, 0], "o": [0, 0], "i": [0, 0]},
+        {"p": [10, 10], "o": [0, 0], "i": [0, 0]},
+    ]}]}
+    # Open path stays open ...
+    open_edges = path_to_edges(value)
+    assert not open_edges.endswith("|0 0")
+    # ... but a fill needs the closing segment back to the start point.
+    closed_edges = path_to_edges(value, force_close=True)
+    assert closed_edges.endswith("|0 0")
+
+
+def test_flatten_cubic_hits_endpoints():
+    from tsproj2fla.converter import _flatten_cubic
+
+    pts = _flatten_cubic((0, 0), (10, 10), (20, 10), (30, 0))
+    assert pts[-1][0] == pytest.approx(30, abs=1e-6)
+    assert pts[-1][1] == pytest.approx(0, abs=1e-6)
+    assert len(pts) > 1
+
+
+def test_dom_layers_are_contiguous_from_zero(tmp_path):
+    """Every layer must have a frame starting at index 0 (Animate requirement)."""
+    src = tmp_path / "Test.tsproj"
+    build_project_zip(src)
+    project = load_project(src)
+    from tsproj2fla.converter import convert
+    import re
+
+    data, _ = convert(project)
+    dom = zipfile.ZipFile(io.BytesIO(data)).read("DOMDocument.xml").decode()
+    for layer in re.findall(r"<DOMLayer[^>]*>(.*?)</DOMLayer>", dom, re.S):
+        indices = [int(i) for i in re.findall(r'<DOMFrame index="(\d+)"', layer)]
+        assert indices, "layer has no frames"
+        assert indices[0] == 0, f"first frame index {indices[0]} != 0"
+
+
+def test_library_item_ids_are_consistent(tmp_path):
+    """Include/bitmap itemIDs must match the items they reference.
+
+    Animate resolves library items by itemID; a mismatch opens an empty stage.
+    """
+    import re
+
+    src = tmp_path / "Test.tsproj"
+    build_project_zip(src)
+    project = load_project(src)
+    from tsproj2fla.converter import convert
+
+    data, _ = convert(project)
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    dom = zf.read("DOMDocument.xml").decode()
+    for href, item_id in re.findall(r'<Include href="([^"]+)" itemID="([^"]+)"', dom):
+        symbol = zf.read(f"LIBRARY/{href}").decode()
+        assert f'itemID="{item_id}"' in symbol, f"itemID mismatch for {href}"
+
+
+def test_mimetype_is_stored_and_first(tmp_path):
+    src = tmp_path / "Test.tsproj"
+    build_project_zip(src)
+    project = load_project(src)
+    from tsproj2fla.converter import convert
+
+    data, _ = convert(project)
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    first = zf.infolist()[0]
+    assert first.filename == "mimetype"
+    assert first.compress_type == zipfile.ZIP_STORED
+    assert zf.read("mimetype") == b"application/vnd.adobe.fla"
+
+
+def test_dat_bitmap_roundtrip():
+    from tsproj2fla.converter import _encode_dat_bitmap, _decode_dat_bitmap
+
+    pixels = bytes([
+        10, 20, 30, 255,   # opaque
+        40, 50, 60, 0,     # transparent
+        70, 80, 90, 128,   # semi-transparent
+    ])
+    data = _encode_dat_bitmap(3, 1, pixels)
+    assert data[0] == 0x03 and data[1] == 0x05  # 32-bit magic
+    w, h, out = _decode_dat_bitmap(data)
+    assert (w, h) == (3, 1)
+    assert out[0:4] == bytes([10, 20, 30, 255])
+    assert out[4:8] == bytes([0, 0, 0, 0])
+    assert out[8] == 70 and out[11] == 128
+
+
+def test_bin_dat_files_are_pixel_planes(tmp_path):
+    src = tmp_path / "Test.tsproj"
+    build_project_zip(src)
+    project = load_project(src)
+    from tsproj2fla.converter import convert
+
+    data, _ = convert(project)
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    dats = [i for i in zf.infolist() if i.filename.startswith("bin/M ")]
+    assert dats, "no bin/M *.dat entries written"
+    for info in dats:
+        blob = zf.read(info.filename)
+        assert blob[0] == 0x03 and blob[1] == 0x05  # not a PNG
+        assert info.compress_type == zipfile.ZIP_STORED
+
 
 
 def test_end_to_end_conversion(tmp_path):
@@ -241,3 +351,38 @@ def test_reverse_layer_order(tmp_path):
     fwd_names = re.findall(r'<DOMLayer name="([^"]+)"', zipfile.ZipFile(io.BytesIO(fwd)).read("DOMDocument.xml").decode())
     rev_names = re.findall(r'<DOMLayer name="([^"]+)"', zipfile.ZipFile(io.BytesIO(rev)).read("DOMDocument.xml").decode())
     assert fwd_names == list(reversed(rev_names))
+
+
+def test_load_sqlite_deserialize_leaves_no_temp_files():
+    """The in-memory path must not create temporary files at all."""
+    import tsproj2fla.tsproj as tsproj
+
+    before = set(Path(tempfile.gettempdir()).glob("*.sqlite"))
+    handle = tsproj._load_sqlite(_sqlite_bytes(lambda c: c.execute("CREATE TABLE t (x)")))
+    handle.close()
+    after = set(Path(tempfile.gettempdir()).glob("*.sqlite"))
+    assert before == after
+    assert tsproj._HAS_DESERIALIZE  # this environment uses the in-memory path
+
+
+def test_load_sqlite_fallback_removes_temp_file(monkeypatch):
+    """Old-Python fallback must delete its temp file once the connection closes."""
+    import tsproj2fla.tsproj as tsproj
+
+    monkeypatch.setattr(tsproj, "_HAS_DESERIALIZE", False)
+    handle = tsproj._load_sqlite(_sqlite_bytes(lambda c: c.execute("CREATE TABLE t (x)")))
+    tmp_path = Path(handle.tmp_path)
+    assert tmp_path.exists()
+    # The file must still exist while the connection is open: this is the Windows
+    # lock that made the old code fail when it deleted the file before closing.
+    handle.close()
+    assert not tmp_path.exists()
+
+
+def test_load_project_leaves_no_temp_files(tmp_path):
+    src = tmp_path / "Test.tsproj"
+    build_project_zip(src)
+    before = set(Path(tempfile.gettempdir()).glob("*.sqlite"))
+    load_project(src)
+    after = set(Path(tempfile.gettempdir()).glob("*.sqlite"))
+    assert before == after

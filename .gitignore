@@ -6,3 +6,8 @@ build/
 .samples/
 *.fla
 *.tsproj
+
+# PyInstaller output (platform-specific, built via tools/build_exe.py)
+/dist/tsproj2fla
+/dist/tsproj2fla.exe
+/build/

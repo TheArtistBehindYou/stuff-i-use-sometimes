@@ -1,0 +1,5 @@
+# Keep shell/macOS launchers LF, Windows launcher CRLF.
+*.sh text eol=lf
+*.command text eol=lf
+*.bat text eol=crlf
+*.py text eol=lf
