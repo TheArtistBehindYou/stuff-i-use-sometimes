@@ -46,12 +46,12 @@ if not defined PY (
     goto :end
 )
 
-REM --- make sure the two required libraries are present -----------------
-"%PY%" -c "import PIL, lz4" >nul 2>nul
+REM --- make sure the required library is present ------------------------
+"%PY%" -c "import lz4" >nul 2>nul
 if errorlevel 1 (
     echo Installing the required library ^(lz4^). This happens once...
     "%PY%" -m pip install --quiet --disable-pip-version-check lz4
-    "%PY%" -c "import PIL, lz4" >nul 2>nul
+    "%PY%" -c "import lz4" >nul 2>nul
     if errorlevel 1 (
         echo.
         echo Could not install lz4 automatically.
