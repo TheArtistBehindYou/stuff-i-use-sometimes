@@ -25,14 +25,16 @@ find_python() {
 }
 
 find_script() {
-    for candidate in \
-        "$DIR/tsproj2fla.py" \
-        "$DIR/../dist/tsproj2fla.py" \
-        "$DIR/../tsproj2fla.py"; do
-        if [ -f "$candidate" ]; then
-            printf '%s' "$candidate"
-            return 0
-        fi
+    # Accept tsproj2fla.py and near-misses such as tsproj2fla.py.txt (what you
+    # get when a browser saves the raw script instead of downloading it).
+    local dir candidate
+    for dir in "$DIR" "$DIR/.." "$DIR/../dist"; do
+        for candidate in "$dir"/tsproj2fla*.py*; do
+            if [ -f "$candidate" ]; then
+                printf '%s' "$candidate"
+                return 0
+            fi
+        done
     done
     return 1
 }
@@ -65,8 +67,14 @@ elif command -v tsproj2fla >/dev/null 2>&1; then
     RUN=(tsproj2fla)
 else
     echo "Could not find tsproj2fla.py next to this launcher, and the 'tsproj2fla'"
-    echo "command is not installed. Download tsproj2fla.py from the repo's dist/"
-    echo "folder and place it beside this file."
+    echo "command is not installed."
+    echo
+    echo "Grab the drag-and-drop bundle from the repo's dist/ folder:"
+    echo "    tsproj2fla-drag-and-drop.zip"
+    echo "Unzip it and keep tsproj2fla.py in the same folder as this file."
+    echo
+    echo "If you downloaded the raw tsproj2fla.py and it saved as"
+    echo "tsproj2fla.py.txt, rename it to tsproj2fla.py."
     pause
     exit 1
 fi

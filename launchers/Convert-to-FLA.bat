@@ -14,8 +14,10 @@ setlocal
 cd /d "%~dp0"
 
 set "SCRIPT="
-if exist "%~dp0tsproj2fla.py" set "SCRIPT=%~dp0tsproj2fla.py"
-if not defined SCRIPT if exist "%~dp0..\dist\tsproj2fla.py" set "SCRIPT=%~dp0..\dist\tsproj2fla.py"
+REM Accept tsproj2fla.py and near-misses (e.g. tsproj2fla.py.txt, which is what
+REM you get when a browser saves the raw script instead of downloading it).
+for %%F in ("%~dp0tsproj2fla*.py*") do if not defined SCRIPT if exist "%%~fF" set "SCRIPT=%%~fF"
+for %%F in ("%~dp0..\dist\tsproj2fla*.py*") do if not defined SCRIPT if exist "%%~fF" set "SCRIPT=%%~fF"
 
 set "PY="
 where python >nul 2>nul && set "PY=python"
@@ -32,8 +34,14 @@ if not defined SCRIPT (
     where tsproj2fla >nul 2>nul
     if errorlevel 1 (
         echo Could not find tsproj2fla.py next to this launcher, and the
-        echo 'tsproj2fla' command is not installed. Download tsproj2fla.py from
-        echo the repo's dist\ folder and place it beside this file.
+        echo 'tsproj2fla' command is not installed.
+        echo.
+        echo Grab the drag-and-drop bundle from the repo's dist\ folder:
+        echo     tsproj2fla-drag-and-drop.zip
+        echo Unzip it and keep tsproj2fla.py in the same folder as this file.
+        echo.
+        echo If you downloaded the raw tsproj2fla.py and it saved as
+        echo tsproj2fla.py.txt, rename it to tsproj2fla.py.
         goto :end
     )
     echo Ready.

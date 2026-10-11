@@ -4,6 +4,8 @@ Produces, under ``dist/``:
 
 * ``tsproj2fla.py``  - a single-file, dependency-light script (needs only lz4)
 * ``tsproj2fla.zip`` - the full source tree (package + tests + docs + samples)
+* ``tsproj2fla-drag-and-drop.zip`` - the single-file script next to the
+  launchers, laid out flat so you can drag a .tsproj onto them right away
 * ``tsproj2fla-<version>-py3-none-any.whl`` and ``.tar.gz`` - installable packages
 
 Run with ``python tools/build_dist.py``.
@@ -94,6 +96,28 @@ def build_source_zip() -> Path:
     return out
 
 
+def build_drag_and_drop_zip(single: Path) -> Path:
+    """Bundle the single-file script beside the launchers, laid out flat.
+
+    Downloading the raw ``tsproj2fla.py`` from GitHub usually saves it as
+    ``tsproj2fla.py.txt`` (the browser treats ``text/plain`` as something to
+    display). Shipping it inside a zip avoids that and keeps the launcher and
+    the script in the same folder, which is what the launcher looks for.
+    """
+    out = DIST / "tsproj2fla-drag-and-drop.zip"
+    members = [
+        (single, "tsproj2fla.py"),
+        (ROOT / "launchers/Convert-to-FLA.bat", "Convert-to-FLA.bat"),
+        (ROOT / "launchers/Convert-to-FLA.command", "Convert-to-FLA.command"),
+        (ROOT / "launchers/convert-to-fla.sh", "convert-to-fla.sh"),
+    ]
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path, arcname in members:
+            if path.exists():
+                zf.write(path, arcname)
+    return out
+
+
 def build_wheel() -> list[Path]:
     subprocess.run(
         [sys.executable, "-m", "pip", "install", "--quiet", "build"],
@@ -118,8 +142,10 @@ def main() -> int:
 
     single = build_single_file()
     archive = build_source_zip()
+    dnd = build_drag_and_drop_zip(single)
     print(f"single-file : {single} ({single.stat().st_size/1024:.1f} KiB)")
     print(f"source zip  : {archive} ({archive.stat().st_size/1024:.1f} KiB)")
+    print(f"drag & drop : {dnd} ({dnd.stat().st_size/1024:.1f} KiB)")
 
     wheels = build_wheel()
     for wheel in wheels:
