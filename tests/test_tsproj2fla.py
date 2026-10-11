@@ -97,6 +97,9 @@ def build_project_zip(path: Path) -> None:
     symbol_layer_id = "BBBBBBB2-0000-0000-0000-000000000008"
     symbol_child_id = "CCCCCCC2-0000-0000-0000-000000000009"
     text_id = "DDDDDDD2-0000-0000-0000-00000000000A"
+    audio_id = "EEEEEEE2-0000-0000-0000-00000000000B"
+    audio_layer_id = "FFFFFFF2-0000-0000-0000-00000000000C"
+    audio_drawing_id = "AAAAAAA3-0000-0000-0000-00000000000D"
 
     def data_db(conn):
         conn.execute('CREATE TABLE meta_d (key TEXT PRIMARY KEY, value BLOB)')
@@ -115,6 +118,7 @@ def build_project_zip(path: Path) -> None:
         conn.execute("INSERT INTO scenes VALUES (?, 0)", (scene_id,))
         conn.execute("INSERT INTO res_anim_clips VALUES (?)", (scene_id,))
         conn.execute("INSERT INTO res_anim_clips VALUES (?)", (symbol_clip_id,))
+        conn.execute("INSERT INTO res_audio_clips VALUES (?, 0)", (audio_id,))
         conn.execute(
             "INSERT INTO res_shared_textures VALUES (?, 1, ?, 4, 4, 300, 100, 4, 4)",
             (pixel_id, texture_id),
@@ -150,6 +154,15 @@ def build_project_zip(path: Path) -> None:
                                            "t": "Hello", "fS": 40, "fN": "System Font Bold",
                                            "co": {"r": 1, "g": 1, "b": 1, "a": 1}, "al": 1,
                                            "tf": {"p": [10, 20], "pv": [10, 20]}}).encode()))
+        # Audio layer: not part of lO (ToonSquid keeps it out of the draw list).
+        conn.execute("INSERT INTO drawings VALUES (?, ?)",
+                     (audio_drawing_id, json.dumps({"id": audio_drawing_id, "l": audio_layer_id,
+                                                    "s": 1, "e": 12, "v": 3,
+                                                    "ly": [audio_layer_id]}).encode()))
+        conn.execute("INSERT INTO layers VALUES (?, 9, ?)",
+                     (audio_layer_id, json.dumps({"Na": "Sound", "Id": audio_layer_id, "V": 3, "v": 2,
+                                                  "DI": audio_drawing_id,
+                                                  "aC": {"id": audio_id, "fT": "wav", "v": 1}}).encode()))
 
     def symbol_db(conn):
         conn.execute('CREATE TABLE animationClip (id TEXT PRIMARY KEY, data BLOB)')
@@ -169,11 +182,29 @@ def build_project_zip(path: Path) -> None:
     rgba = bytes([255, 0, 0, 255]) * 16
     texture = _encode_dvtx(4, 4, rgba)
 
+    # Tiny 44.1kHz 16-bit stereo WAV (4 sample frames).
+    frames = 4
+    pcm = bytes(range(frames * 4))  # 4 bytes per frame (2ch * 2 bytes)
+    wav = _make_wav(pcm, channels=2, rate=44100, bits=16)
+
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{root}/data", _sqlite_bytes(data_db))
         zf.writestr(f"{root}/Animations/{scene_id}.tsanim", _sqlite_bytes(anim_db))
         zf.writestr(f"{root}/Animations/{symbol_clip_id}.tsanim", _sqlite_bytes(symbol_db))
         zf.writestr(f"{root}/Textures/{texture_id}", texture)
+        zf.writestr(f"{root}/Audio/{audio_id}", json.dumps({"fT": "wav", "v": 1}).encode())
+        zf.writestr(f"{root}/Audio/{audio_id}.wav", wav)
+
+
+def _make_wav(pcm: bytes, channels: int, rate: int, bits: int) -> bytes:
+    block_align = channels * (bits // 8)
+    byte_rate = rate * block_align
+    header = (
+        b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVE"
+        + b"fmt " + struct.pack("<IHHIIHH", 16, 1, channels, rate, byte_rate, block_align, bits)
+        + b"data" + struct.pack("<I", len(pcm))
+    )
+    return header + pcm
 
 
 # --------------------------------------------------------------------------- #
@@ -314,12 +345,16 @@ def test_dat_bitmap_roundtrip():
         70, 80, 90, 128,   # semi-transparent
     ])
     data = _encode_dat_bitmap(3, 1, pixels)
-    assert data[0] == 0x03 and data[1] == 0x05  # 32-bit magic
+    assert data[0] == 0x03 and data[1] == 0x05  # major/minor magic
+    assert data[24] == 0x01  # flags: hasAlpha
+    assert data[25] == 0x01  # variant: deflate-compressed
     w, h, out = _decode_dat_bitmap(data)
     assert (w, h) == (3, 1)
-    assert out[0:4] == bytes([10, 20, 30, 255])
+    # Premultiplication + the +1 alpha bias are lossy, so allow +/-1 drift.
+    assert abs(out[0] - 10) <= 1 and abs(out[1] - 20) <= 1 and abs(out[2] - 30) <= 1
+    assert out[3] == 255
     assert out[4:8] == bytes([0, 0, 0, 0])
-    assert out[8] == 70 and out[11] == 128
+    assert abs(out[8] - 70) <= 1 and abs(out[11] - 128) <= 1
 
 
 def test_bin_dat_files_are_pixel_planes(tmp_path):
@@ -330,12 +365,37 @@ def test_bin_dat_files_are_pixel_planes(tmp_path):
 
     data, _ = convert(project)
     zf = zipfile.ZipFile(io.BytesIO(data))
-    dats = [i for i in zf.infolist() if i.filename.startswith("bin/M ")]
-    assert dats, "no bin/M *.dat entries written"
+    dats = [i for i in zf.infolist() if i.filename.startswith("bin/M ts_")]
+    assert dats, "no bin/M ts_*.dat entries written"
     for info in dats:
         blob = zf.read(info.filename)
         assert blob[0] == 0x03 and blob[1] == 0x05  # not a PNG
         assert info.compress_type == zipfile.ZIP_STORED
+
+
+def test_audio_is_exported_as_sound_item(tmp_path):
+    """A type-9 layer must produce a DOMSoundItem, a LIBRARY file and a dat."""
+    z, _ = _dom(tmp_path)
+    dom = z.read("DOMDocument.xml").decode()
+    assert "<DOMSoundItem" in dom
+    assert 'soundName="audio_' in dom          # frame fires the library sound
+    assert 'format="44kHz 16bit Stereo"' in dom
+    assert 'sampleCount="4"' in dom            # 16-byte payload / 4 bytes per frame
+
+    snd_names = [n for n in z.namelist() if "audio_" in n]
+    assert any(n.startswith("LIBRARY/audio_") and n.endswith(".wav") for n in snd_names)
+    dat_name = next(n for n in snd_names if n.startswith("bin/M "))
+    payload = z.read(dat_name)
+    # bin dat is the RIFF-stripped PCM, not the whole WAV.
+    assert payload == bytes(range(16))
+    wav = next(n for n in snd_names if n.startswith("LIBRARY/"))
+    assert z.read(wav)[:4] == b"RIFF"
+    # href/name on the item must equal the soundName used on the frame.
+    import re
+
+    item_name = re.search(r'<DOMSoundItem name="([^"]+)"', dom).group(1)
+    sound_name = re.search(r'soundName="([^"]+)"', dom).group(1)
+    assert item_name == sound_name
 
 
 
@@ -380,9 +440,10 @@ def test_reverse_layer_order(tmp_path):
     rev, _ = convert(project, reverse_layers=True)
     fwd_names = re.findall(r'<DOMLayer name="([^"]+)"', zipfile.ZipFile(io.BytesIO(fwd)).read("DOMDocument.xml").decode())
     rev_names = re.findall(r'<DOMLayer name="([^"]+)"', zipfile.ZipFile(io.BytesIO(rev)).read("DOMDocument.xml").decode())
-    # The scene's Background layer is appended last and is unaffected by reversal.
-    assert fwd_names[:-1] == list(reversed(rev_names[:-1]))
+    # "Sound" and the scene "Background" are appended last, unaffected by reversal.
     assert fwd_names[-1] == rev_names[-1] == "Background"
+    assert fwd_names[-2] == rev_names[-2] == "Sound"
+    assert fwd_names[:-2] == list(reversed(rev_names[:-2]))
 
 
 def test_load_sqlite_deserialize_leaves_no_temp_files():
@@ -464,13 +525,22 @@ def test_text_uses_characters_element_and_face(tmp_path):
 
 
 def test_bitmap_dat_header_has_twip_dimensions(tmp_path):
+    from tsproj2fla.converter import _decode_dat_bitmap
+
     z, _ = _dom(tmp_path)
-    name = next(n for n in z.namelist() if n.startswith("bin/M "))
+    name = next(n for n in z.namelist() if n.startswith("bin/M ts_"))
     dat = z.read(name)
     width = int.from_bytes(dat[4:6], "little")
     height = int.from_bytes(dat[6:8], "little")
-    assert int.from_bytes(dat[12:16], "little") == width * 20
-    assert int.from_bytes(dat[20:24], "little") == height * 20
+    # frameRight/frameBottom are twips and sit after frameLeft/frameTop.
+    assert int.from_bytes(dat[8:12], "little") == 0          # frameLeft
+    assert int.from_bytes(dat[12:16], "little") == width * 20  # frameRight
+    assert int.from_bytes(dat[16:20], "little") == 0          # frameTop
+    assert int.from_bytes(dat[20:24], "little") == height * 20  # frameBottom
+    assert dat[24] == 1 and dat[25] == 1  # hasAlpha, compressed
+    w, h, pixels = _decode_dat_bitmap(dat)
+    assert (w, h) == (width, height)
+    assert len(pixels) == width * height * 4
 
 
 def test_symbol_instance_carries_transform(tmp_path):

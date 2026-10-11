@@ -489,6 +489,9 @@ class Converter:
     _item_counter: int = 0
     _bitmap_names: dict[str, str] = field(default_factory=dict)
     _item_ids: dict[str, str] = field(default_factory=dict)
+    _audio_names: dict[str, str] = field(default_factory=dict)
+    _audio_formats: dict[str, tuple[str, int, int]] = field(default_factory=dict)
+    _audio_dats: dict[str, bytes] = field(default_factory=dict)
 
     # -- helpers ---------------------------------------------------------- #
     def item_id(self, key: str) -> str:
@@ -507,8 +510,63 @@ class Converter:
             self._bitmap_names[texture_id] = f"ts_{texture_id[:8]}"
         return self._bitmap_names[texture_id]
 
+    def audio_name(self, audio_id: str) -> str:
+        """Library name (with extension) for ``audio_id``, e.g. ``audio_ab12cd34.wav``.
+
+        Important: Animate's sound lookup does not resolve names with a leading
+        directory the way images do, so the name must be *identical* to the
+        ``soundName`` used on the frame.
+        """
+        if audio_id not in self._audio_names:
+            entry = self.project.audio.get(audio_id) or {}
+            ext = entry.get("ext") or "wav"
+            self._audio_names[audio_id] = f"audio_{audio_id[:8]}.{ext}"
+            data = entry.get("data")
+            if data:
+                try:
+                    dat, label, export_format, samples = _encode_audio_dat(data)
+                except Exception as exc:  # pragma: no cover - defensive
+                    self.warnings.append(f"audio {audio_id}: {exc}")
+                    dat, label, export_format, samples = data, "44kHz 16bit Stereo", 1, 0
+                self._audio_formats[audio_id] = (label, export_format, samples)
+                self._audio_dats[audio_id] = dat
+        return self._audio_names[audio_id]
+
     def layer_color(self, index: int) -> str:
         return LAYER_COLORS[index % len(LAYER_COLORS)]
+
+    def _audio_layer_xml(
+        self, clip: Clip, layer_id: str, color_index: int, name: str
+    ) -> str:
+        """A ``DOMLayer`` whose frame fires a library sound via ``soundName``.
+
+        XFL has no sound *element*: a sound is played by naming the library item
+        on the keyframe (``soundName``).  ToonSquid stores the audio on a
+        type-9 layer that points at a drawing whose ``s``/``e`` give the frame
+        span, and whose ``aC`` carries the audio-clip id.
+        """
+        layer_json = clip.layers.get(layer_id, {})
+        audio_id = (layer_json.get("aC") or {}).get("id")
+        if not audio_id or audio_id not in self.project.audio:
+            return ""
+        drawing = clip.drawings.get(layer_json.get("DI")) or {}
+        start = max(int(drawing.get("s", 1)) - 1, 0)
+        end = max(int(drawing.get("e", start + 1)), start + 1)
+        duration = max(end - start, 1)
+        sound = self.audio_name(audio_id)
+        frames = []
+        if start > 0:
+            frames.append(
+                f'<DOMFrame index="0" duration="{start}" keyMode="9728"><elements/></DOMFrame>'
+            )
+        frames.append(
+            f'<DOMFrame index="{start}" duration="{duration}" keyMode="9728" '
+            f'soundName={quoteattr(sound)} soundSync="start"><elements/></DOMFrame>'
+        )
+        return (
+            f'<DOMLayer name={quoteattr(name)} color="{self.layer_color(color_index)}">'
+            f"<frames>{''.join(frames)}</frames></DOMLayer>"
+        )
 
     # -- drawing layer -> element ---------------------------------------- #
     def drawing_layer_element(
@@ -728,9 +786,30 @@ class Converter:
             if xml:
                 layers_xml.append(xml)
                 color_index += 1
+        audio_xml = self._build_audio_layers(clip, color_index)
+        layers_xml.extend(audio_xml)
         if scene:
             layers_xml.append(self._background_layer("Background", max(clip.total_frames, 1)))
         return layers_xml
+
+    def _build_audio_layers(self, clip: Clip, color_index: int = 0) -> list[str]:
+        """Sound layers for ``clip``'s type-9 (audio) layers, if any.
+
+        Iterates ``clip.layers`` rather than ``clip.layer_order``: ToonSquid
+        keeps audio layers out of the ordered draw list, but they are present in
+        the layer table.
+        """
+        out: list[str] = []
+        for lid in clip.layers:
+            if clip.layer_type(lid) != LT_AUDIO:
+                continue
+            name = clip.layers.get(lid, {}).get("Na") or "Sound"
+            xml = self._audio_layer_xml(clip, lid, color_index, name)
+            if xml:
+                out.append(xml)
+                color_index += 1
+        return out
+
 
     def _layer_specs(
         self,
@@ -824,6 +903,33 @@ def convert(project: Project, reverse_layers: bool = True) -> tuple[bytes, list[
 
     symbols_xml = []  # symbols are flattened into layers, not emitted as clips
 
+    # Any audio referenced by a type-9 layer anywhere in the project.
+    used_audio: list[str] = []
+    seen_audio: set[str] = set()
+    for clip in project.clips.values():
+        for lid in clip.layers:
+            if clip.layer_type(lid) != LT_AUDIO:
+                continue
+            aid = (clip.layers.get(lid, {}).get("aC") or {}).get("id")
+            if aid and aid in project.audio and aid not in seen_audio:
+                seen_audio.add(aid)
+                used_audio.append(aid)
+    for audio_id in used_audio:
+        name = converter.audio_name(audio_id)
+        label, export_format, samples = converter._audio_formats.get(
+            audio_id, ("44kHz 16bit Stereo", 1, 0)
+        )
+        entry = project.audio.get(audio_id) or {}
+        ext = entry.get("ext") or "wav"
+        media_xml.append(
+            f'<DOMSoundItem name={quoteattr(name)} itemID="{converter.item_id("snd:" + audio_id)}" '
+            f'sourceExternalFilepath={quoteattr(".\\LIBRARY\\" + name)} '
+            f'externalFileSize="{len(entry.get("data") or b"")}" '
+            f'href={quoteattr(name)} soundDataHRef={quoteattr("M " + name + " 0.dat")} '
+            f'format={quoteattr(label)} exportFormat="{export_format}" '
+            f'sampleCount="{samples}"/>'
+        )
+
     dom = (
         '<DOMDocument xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
         f'xmlns="{XFL_NS}" width="{width}" height="{height}" frameRate="{fps}" '
@@ -861,7 +967,7 @@ def convert(project: Project, reverse_layers: bool = True) -> tuple[bytes, list[
             w, h, raw = project.textures[texture_id]
             name = converter.bitmap_name(texture_id)
             # LIBRARY/*.png is the preview bitmap Animate shows; bin/M *.dat is
-            # the actual bitmap data, stored as an uncompressed pixel plane.
+            # the actual bitmap data (deflate-compressed A,B,G,R plane).
             zf.writestr(f"LIBRARY/{name}.png", _encode_png(w, h, raw))
             zf.writestr(
                 zipfile.ZipInfo(f"bin/M {name} 0.dat"),
@@ -869,7 +975,23 @@ def convert(project: Project, reverse_layers: bool = True) -> tuple[bytes, list[
                 compress_type=zipfile.ZIP_STORED,
             )
 
+        for audio_id in used_audio:
+            entry = project.audio.get(audio_id) or {}
+            data = entry.get("data")
+            if not data:
+                continue
+            name = converter.audio_name(audio_id)
+            # LIBRARY/<name> is the source file Animate imports; bin/M *.dat is
+            # the decoded PCM (WAV) or the MP3 payload it plays.
+            zf.writestr(f"LIBRARY/{name}", data)
+            zf.writestr(
+                zipfile.ZipInfo(f"bin/M {name} 0.dat"),
+                converter._audio_dats.get(audio_id, data),
+                compress_type=zipfile.ZIP_STORED,
+            )
+
     return buf.getvalue(), converter.warnings
+
 
 
 def _png_chunk(tag: bytes, payload: bytes) -> bytes:
@@ -904,50 +1026,73 @@ def _encode_png(width: int, height: int, rgba: bytes) -> bytes:
 
 
 def _encode_dat_bitmap(width: int, height: int, rgba: bytes) -> bytes:
-    """Encode raw RGBA pixels as an Animate ``.dat`` lossless bitmap.
+    """Encode raw RGBA pixels as an Animate ``bin/M *.dat`` bitmap.
 
-    Layout (little-endian), matching JPEXS' LosslessImageBinDataReader:
-      magic 0x03 0x05 (32-bit), rowSize = width*4, width, height, 16 reserved
-      bytes, hasAlpha, variant (0 = verbatim pixel plane), then pixels.
-    Pixels are stored as A,R,G,B with colour premultiplied by alpha, using the
-    reader's ``a-1`` pairing (so stored alpha is ``a+1`` for partial alpha).
+    Layout (little-endian), matching JPEXS' ``LosslessImageBinData`` reader and
+    writer (major 3 = alpha, variant 1 = deflate)::
+
+        u8  major=3, u8 minor=5
+        u16 rowSize (bytes per row), u16 width, u16 height
+        u32 frameLeft=0, u32 frameRight=width*20, u32 frameTop=0, u32 frameBottom=height*20
+        u8  flags (bit 0 = hasAlpha)
+        u8  variant = 1 (compressed)
+        repeat { u16 chunkLen; chunkLen bytes } u16 0
+
+    Pixels are stored A,B,G,R, colour premultiplied by alpha, with partial
+    alpha biased by one (the reader subtracts one), per the reference encoder.
+    Animate refuses the file if this header is malformed, so it must match.
     """
-    header = bytearray(26)
-    header[0] = 0x03
-    header[1] = 0x05
-    header[2:4] = (width * 4).to_bytes(2, "little")
-    header[4:6] = width.to_bytes(2, "little")
-    header[6:8] = height.to_bytes(2, "little")
-    header[12:16] = (width * 20).to_bytes(4, "little")  # frameRight, twips
-    header[20:24] = (height * 20).to_bytes(4, "little")  # frameBottom, twips
-    header[24] = 1  # hasAlpha
-    header[25] = 0  # variant 0: verbatim A,R,G,B pixel plane
+    header = bytearray()
+    header += bytes((0x03, 0x05))
+    header += struct.pack("<HHH", width * 4, width, height)
+    header += struct.pack("<IIII", 0, width * TWIPS, 0, height * TWIPS)
+    header += bytes((0x01, 0x01))  # flags: hasAlpha; variant: compressed
 
-    out = bytearray(len(rgba))
+    raw = bytearray(len(rgba))
     for i in range(0, len(rgba), 4):
         r, g, b, a = rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]
-        if a == 0:
-            sr = sg = sb = sa = 0
-        elif a == 255:
-            sr, sg, sb, sa = r, g, b, 255
-        else:
-            sa = a + 1
-            sr = (r * a) // 256
-            sg = (g * a) // 256
-            sb = (b * a) // 256
-        out[i], out[i + 1], out[i + 2], out[i + 3] = sa, sr, sg, sb
-    return bytes(header) + bytes(out)
+        if a != 255:
+            r = (r * a) // 256
+            g = (g * a) // 256
+            b = (b * a) // 256
+        if a != 0 and a != 255:
+            a += 1
+        raw[i], raw[i + 1], raw[i + 2], raw[i + 3] = a, b, g, r
+
+    data = zlib.compress(bytes(raw), 1)
+    out = bytearray(header)
+    for pos in range(0, len(data), 2048):  # large chunks crash Flash; 2048 = CS5
+        chunk = data[pos:pos + 2048]
+        out += struct.pack("<H", len(chunk)) + chunk
+    out += struct.pack("<H", 0)
+    return bytes(out)
 
 
 def _decode_dat_bitmap(data: bytes) -> tuple[int, int, bytes]:
-    """Decode a variant-0 ``.dat`` bitmap back to RGBA (for tests)."""
+    """Decode a ``bin/M *.dat`` bitmap (variant 0 or 1) back to RGBA."""
     assert data[0] == 0x03 and data[1] == 0x05
     width = int.from_bytes(data[4:6], "little")
     height = int.from_bytes(data[6:8], "little")
-    pixels = data[26:26 + width * height * 4]
+    flags = data[24]
+    has_alpha = bool(flags & 1)
+    variant = data[25]
+    body = data[26:]
+    if variant == 1:
+        buf = bytearray()
+        pos = 0
+        while pos + 2 <= len(body):
+            length = int.from_bytes(body[pos:pos + 2], "little")
+            pos += 2
+            if length == 0:
+                break
+            buf += body[pos:pos + length]
+            pos += length
+        pixels = zlib.decompress(bytes(buf))
+    else:
+        pixels = body[:width * height * 4]
     out = bytearray(len(pixels))
     for i in range(0, len(pixels), 4):
-        sa, sr, sg, sb = pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]
+        sa, sb, sg, sr = pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]
         if sa == 0:
             out[i + 3] = 0
         elif sa == 255:
@@ -958,7 +1103,77 @@ def _decode_dat_bitmap(data: bytes) -> tuple[int, int, bytes]:
             out[i + 1] = min(255, (sg * 256) // a) if a else 0
             out[i + 2] = min(255, (sb * 256) // a) if a else 0
             out[i + 3] = a
+    if not has_alpha:
+        for i in range(3, len(out), 4):
+            out[i] = 255
     return width, height, bytes(out)
+
+
+def _wav_params(wav: bytes) -> tuple[int, int, int, int]:
+    """Return ``(sample_rate, channels, bits, sample_count)`` for a WAV blob."""
+    channels = int.from_bytes(wav[22:24], "little")
+    sample_rate = int.from_bytes(wav[24:28], "little")
+    bits = int.from_bytes(wav[34:36], "little")
+    # Walk RIFF chunks to find the ``data`` payload (its offset is not fixed).
+    pos = 12
+    data_size = 0
+    while pos + 8 <= len(wav):
+        cid = wav[pos:pos + 4]
+        size = int.from_bytes(wav[pos + 4:pos + 8], "little")
+        if cid == b"data":
+            data_size = size
+            break
+        pos += 8 + size + (size & 1)
+    bytes_per_sample = max(bits // 8, 1) * max(channels, 1)
+    sample_count = data_size // bytes_per_sample if bytes_per_sample else 0
+    return sample_rate, channels, bits, sample_count
+
+
+def _encode_audio_dat(wav: bytes) -> tuple[bytes, str, int, int]:
+    """Return ``(dat_bytes, format_label, export_format, sample_count)``.
+
+    Animate stores a sound in two places: ``LIBRARY/<name>.<ext>`` holds the
+    original file, while ``bin/M *.dat`` holds the *decoded* PCM for WAV (the
+    MP3 payload verbatim for MP3).  The WAV RIFF header is stripped.
+    """
+    if wav[:4] == b"RIFF":  # WAV -> decoded 16-bit PCM
+        rate, channels, bits, samples = _wav_params(wav)
+        pos = wav.find(b"data")
+        payload = wav[pos + 8:] if pos != -1 else wav[44:]
+        return payload, _audio_label(rate, bits, channels), 1, samples
+
+    if wav[:3] == b"ID3" or wav[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2") or wav[:2] == b"\xff\xfa":
+        rate, bitrate = _mp3_params(wav)  # MP3 -> payload verbatim
+        samples = int(len(wav) / max(bitrate, 1) * rate / 8) if bitrate and rate else 0
+        return wav, _audio_label(rate, 16, 2), 1, samples
+
+    return wav, "44kHz 16bit Stereo", 1, 0
+
+
+def _audio_label(rate: int, bits: int, channels: int) -> str:
+    khz = {44100: "44", 22050: "22", 11025: "11", 5500: "5.5"}.get(rate, str(round(rate / 1000)))
+    return f"{khz}kHz {'16bit' if bits == 16 else '8bit'} {'Stereo' if channels == 2 else 'Mono'}"
+
+
+def _mp3_params(data: bytes) -> tuple[int, int]:
+    """Return ``(sample_rate, bitrate_bps)`` from the first MPEG audio frame."""
+    pos = 0
+    if data[:3] == b"ID3" and len(data) > 10:
+        size = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) | ((data[8] & 0x7F) << 7) | (data[9] & 0x7F)
+        pos = 10 + size
+    while pos + 4 <= len(data):
+        if data[pos] == 0xFF and (data[pos + 1] & 0xE0) == 0xE0:
+            break
+        pos += 1
+    if pos + 4 > len(data):
+        return 44100, 128000
+    hdr = data[pos:pos + 4]
+    version = (hdr[1] >> 3) & 0x03
+    sample_rates = {3: [44100, 48000, 32000], 2: [22050, 24000, 16000], 0: [11025, 12000, 8000]}
+    rate = sample_rates.get(version, [44100])[(hdr[2] >> 2) & 0x03]
+    bitrates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0]
+    bitrate = bitrates[(hdr[2] >> 4) & 0x0F] * 1000
+    return rate, bitrate
 
 
 def _publish_settings(width: int, height: int, fps: int) -> str:

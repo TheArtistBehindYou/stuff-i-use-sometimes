@@ -54,7 +54,10 @@ is a flat RGBA buffer (`w*h*4`).
 
 **XFL / `.fla`**: ZIP with `mimetype` = `application/vnd.adobe.fla`, `DOMDocument.xml`
 (ns `http://ns.adobe.com/xfl/2008/`, `width`/`height`/`frameRate`), `LIBRARY/*.xml`
-symbols + `LIBRARY/*.png` bitmaps, `bin/M <name> 0.dat` bitmap data.
+symbols + `LIBRARY/*.png` bitmaps + `LIBRARY/<sound>.<ext>` sounds, `bin/M <name> 0.dat`
+bitmap/sound data. Library items are declared in `DOMDocument.xml` as
+`<DOMBitmapItem>` / `<DOMSoundItem>` and referenced from frames by
+`libraryItemName` (bitmaps) or `soundName` (sounds).
 
 - Edge string grammar: `!x y` moveTo, `|x y` / `/x y` lineTo, `[cx cy x y` / `]cx cy x y`
   quadratic. **Coordinates are twips** (×20). `Edge` carries
@@ -91,12 +94,26 @@ symbols + `LIBRARY/*.png` bitmaps, `bin/M <name> 0.dat` bitmap data.
   stage. Never mint a fresh ID per call — cache it per item (`item_id()`).
 - `mimetype` must be the **first** zip entry and stored **uncompressed**
   (`ZIP_STORED`); Animate validates this like EPUB/ODF.
-- `bin/M <name> 0.dat` is **not** a PNG. It is a raw bitmap: magic `0x03 0x05`
-  (32-bit) / `0x03 0x03` (8-bit), then rowSize/width/height (u16 LE), 16 reserved
-  bytes, `hasAlpha` (byte 24), `variant` (byte 25), then pixels as A,R,G,B with
-  colour premultiplied by alpha (stored alpha is `a+1` for partial alpha; see
-  JPEXS `LosslessImageBinDataReader`). `variant=0` with exactly `w*h*4` payload
-  bytes is read as a verbatim pixel plane. Store it uncompressed.
+- `bin/M <name> 0.dat` for a **bitmap** is **not** a PNG. Header (LE): magic
+  `0x03 0x05` (32-bit) / `0x03 0x03` (8-bit), then `rowSize` (u16, = width × 4
+  for 32-bit), `width` (u16), `height` (u16), then 16 bytes of fill-rect values
+  (`frameLeft/Right/Top/Bottom` in twips = px × 20, all u32), then `flags`
+  (byte 24, bit0 = `hasAlpha`) and `variant` (byte 25). `variant == 1` means the
+  rest of the file is zlib/deflate-compressed; decompress to a `width*height*4`
+  pixel plane. `variant == 0` (only when the payload is exactly `w*h*4`) is
+  read verbatim. Pixels are stored **A,B,G,R** byte order per pixel, with the
+  stored alpha biased: Animate uses `alpha' = a + (a < 255 ? 1 : 0)` (see JPEXS
+  `LosslessImageBinDataReader` / `ImageBinDataGenerator`). Store it uncompressed.
+- `bin/M <name> 0.dat` for a **sound** is the decoded audio, not the source
+  file: for a WAV it is raw 16-bit PCM with the RIFF header stripped
+  (`sampleCount × channels × 2` bytes); for an MP3 it is the MP3 payload
+  verbatim. `LIBRARY/<name>.<ext>` keeps the original imported file. A sound is
+  *played* by putting `soundName="<library name>"` (e.g. `audio_ab12cd34.wav`)
+  on the keyframe `DOMFrame` — the name must match the `DOMSoundItem` `name`/
+  `href` exactly (Animate resolves sounds by name, and unlike bitmaps does not
+  resolve leading directories). Audio layers are layer `type == 9`; ToonSquid
+  keeps them **out of `lO`**, so scan the whole `layers` table, not `layer_order`.
+
 
 ## Flattening symbols into layers
 

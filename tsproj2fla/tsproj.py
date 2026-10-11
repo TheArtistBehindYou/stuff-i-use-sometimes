@@ -212,9 +212,17 @@ def load_project(path: str | Path) -> Project:
             if member not in names:
                 continue
             info = _json_blob(zf.read(member))
-            wav = None
-            if f"{member}.wav" in names:
-                wav = zf.read(f"{member}.wav")
-            project.audio[aid] = {"info": info, "wav": wav}
+            declared = str(info.get("fT") or "wav").lower()
+            candidates = [declared] + [e for e in ("wav", "mp3", "m4a", "aac") if e != declared]
+            data = None
+            ext = declared
+            for suffix in candidates:
+                if f"{member}.{suffix}" in names:
+                    data = zf.read(f"{member}.{suffix}")
+                    ext = suffix
+                    break
+            project.audio[aid] = {"info": info, "data": data, "ext": ext}
+            if data is None:
+                project.warnings.append(f"audio {aid}: payload missing")
 
     return project

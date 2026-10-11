@@ -111,6 +111,7 @@ open("Out.fla", "wb").write(fla_bytes)
 | Vector layer (fills + strokes) | `DOMShape` with an XFL `edges` string |
 | Pixel / painted layer | `DOMBitmapInstance` + `DOMBitmapItem` (`LIBRARY/*.png`, `bin/*.dat`) |
 | Text layer | `DOMStaticText` |
+| Audio layer (type 9) | `DOMSoundItem` + `soundName` on the keyframe (`LIBRARY/*.wav`, `bin/*.dat`) |
 | Symbol / nested clip layer | `DOMSymbolInstance` referencing a library symbol |
 | Group layer | flattened into its child layers |
 | Frame-by-frame drawings | one keyframe per drawing span |
@@ -148,8 +149,10 @@ Both ToonSquid schemas are handled:
   keyframes continuously; the converter emits one keyframe per drawing (with the
   transform sampled at the drawing's first frame) and does not reproduce tweened
   motion, easing, or per-frame colour changes as Animate motion tweens.
-* **Audio and video are not embedded.** ToonSquid audio metadata is parsed, but
-  clips are not yet attached to XFL sound layers.
+* **Audio is embedded as PCM, not re-encoded.** Each type-9 layer becomes a
+  `DOMSoundItem` (with a matching `soundName` on its keyframe). WAV sources are
+  stored as decoded 16-bit PCM in `bin/M *.dat` with the original file kept in
+  `LIBRARY/`; MP3 sources are stored verbatim. Video is still ignored.
 * **Some layer types are skipped:** camera, scroll/parallax, adjustment/effect
   and background layers are dropped (they have no direct XFL equivalent).
 * **Strokes are solid only.** ToonSquid's textured/variable-width brushes become
