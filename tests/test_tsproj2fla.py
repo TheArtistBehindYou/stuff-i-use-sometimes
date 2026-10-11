@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sqlite3
 import struct
 import tempfile
@@ -92,6 +93,10 @@ def build_project_zip(path: Path) -> None:
     drawing_id = "DDDDDDD1-0000-0000-0000-000000000004"
     texture_id = "EEEEEEE1-0000-0000-0000-000000000005"
     pixel_id = "FFFFFFF1-0000-0000-0000-000000000006"
+    symbol_clip_id = "AAAAAAA2-0000-0000-0000-000000000007"
+    symbol_layer_id = "BBBBBBB2-0000-0000-0000-000000000008"
+    symbol_child_id = "CCCCCCC2-0000-0000-0000-000000000009"
+    text_id = "DDDDDDD2-0000-0000-0000-00000000000A"
 
     def data_db(conn):
         conn.execute('CREATE TABLE meta_d (key TEXT PRIMARY KEY, value BLOB)')
@@ -109,6 +114,7 @@ def build_project_zip(path: Path) -> None:
         )
         conn.execute("INSERT INTO scenes VALUES (?, 0)", (scene_id,))
         conn.execute("INSERT INTO res_anim_clips VALUES (?)", (scene_id,))
+        conn.execute("INSERT INTO res_anim_clips VALUES (?)", (symbol_clip_id,))
         conn.execute(
             "INSERT INTO res_shared_textures VALUES (?, 1, ?, 4, 4, 300, 100, 4, 4)",
             (pixel_id, texture_id),
@@ -122,7 +128,7 @@ def build_project_zip(path: Path) -> None:
         clip = {
             "na": "Scene 1", "fr": 24, "tF": 12, "re": {"w": 640, "h": 480},
             "id": scene_id, "v": 5,
-            "lO": [anim_layer_id, vector_id, pixel_id],
+            "lO": [anim_layer_id, vector_id, pixel_id, symbol_layer_id, text_id],
         }
         conn.execute("INSERT INTO animationClip VALUES (?, ?)", (scene_id, json.dumps(clip).encode()))
 
@@ -136,6 +142,29 @@ def build_project_zip(path: Path) -> None:
         conn.execute("INSERT INTO layers VALUES (?, 0, ?)",
                      (pixel_id, json.dumps({"Na": "Pixel", "Id": pixel_id, "V": 3, "v": 4,
                                             "tf": {"p": [300, 100], "pv": [300, 100]}}).encode()))
+        conn.execute("INSERT INTO layers VALUES (?, 4, ?)",
+                     (symbol_layer_id, json.dumps({"Na": "Squid", "Id": symbol_layer_id, "V": 3, "v": 4,
+                                                   "cl": {"v": 1, "id": symbol_clip_id}}).encode()))
+        conn.execute("INSERT INTO layers VALUES (?, 2, ?)",
+                     (text_id, json.dumps({"Na": "Title", "Id": text_id, "V": 3, "v": 5,
+                                           "t": "Hello", "fS": 40, "fN": "System Font Bold",
+                                           "co": {"r": 1, "g": 1, "b": 1, "a": 1}, "al": 1,
+                                           "tf": {"p": [10, 20], "pv": [10, 20]}}).encode()))
+
+    def symbol_db(conn):
+        conn.execute('CREATE TABLE animationClip (id TEXT PRIMARY KEY, data BLOB)')
+        conn.execute('CREATE TABLE drawings (id TEXT PRIMARY KEY, data BLOB)')
+        conn.execute('CREATE TABLE layers (id TEXT PRIMARY KEY, type INTEGER, data BLOB)')
+        conn.execute('CREATE TABLE meta_i (key TEXT PRIMARY KEY, value INTEGER)')
+        symbol_clip = {
+            "na": "Squid", "fr": 24, "tF": 12, "re": {"w": 640, "h": 480},
+            "id": symbol_clip_id, "v": 5,
+            "lO": [symbol_child_id],
+        }
+        conn.execute("INSERT INTO animationClip VALUES (?, ?)",
+                     (symbol_clip_id, json.dumps(symbol_clip).encode()))
+        conn.execute("INSERT INTO layers VALUES (?, 3, ?)",
+                     (symbol_child_id, json.dumps(_vector_layer(symbol_child_id)).encode()))
 
     rgba = bytes([255, 0, 0, 255]) * 16
     texture = _encode_dvtx(4, 4, rgba)
@@ -143,6 +172,7 @@ def build_project_zip(path: Path) -> None:
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{root}/data", _sqlite_bytes(data_db))
         zf.writestr(f"{root}/Animations/{scene_id}.tsanim", _sqlite_bytes(anim_db))
+        zf.writestr(f"{root}/Animations/{symbol_clip_id}.tsanim", _sqlite_bytes(symbol_db))
         zf.writestr(f"{root}/Textures/{texture_id}", texture)
 
 
@@ -350,7 +380,9 @@ def test_reverse_layer_order(tmp_path):
     rev, _ = convert(project, reverse_layers=True)
     fwd_names = re.findall(r'<DOMLayer name="([^"]+)"', zipfile.ZipFile(io.BytesIO(fwd)).read("DOMDocument.xml").decode())
     rev_names = re.findall(r'<DOMLayer name="([^"]+)"', zipfile.ZipFile(io.BytesIO(rev)).read("DOMDocument.xml").decode())
-    assert fwd_names == list(reversed(rev_names))
+    # The scene's Background layer is appended last and is unaffected by reversal.
+    assert fwd_names[:-1] == list(reversed(rev_names[:-1]))
+    assert fwd_names[-1] == rev_names[-1] == "Background"
 
 
 def test_load_sqlite_deserialize_leaves_no_temp_files():
@@ -386,3 +418,64 @@ def test_load_project_leaves_no_temp_files(tmp_path):
     load_project(src)
     after = set(Path(tempfile.gettempdir()).glob("*.sqlite"))
     assert before == after
+
+
+def _dom(tmp_path):
+    src = tmp_path / "Test.tsproj"
+    build_project_zip(src)
+    from tsproj2fla.converter import convert
+    fla, _ = convert(load_project(src))
+    return zipfile.ZipFile(io.BytesIO(fla)), fla
+
+
+def test_symbols_are_flattened_into_layers(tmp_path):
+    """Symbols must not survive as library clips; their layers are inlined."""
+    z, fla = _dom(tmp_path)
+    dom = z.read("DOMDocument.xml").decode()
+    assert "<Include" not in dom
+    assert "DOMSymbolInstance" not in dom
+    assert not [n for n in z.namelist() if n.startswith("LIBRARY/") and n.endswith(".xml")]
+    # The symbol's child vector layer is now a real layer on the scene timeline.
+    assert 'name="Squid / Vector"' in dom
+    squid = re.search(r'<DOMLayer name="Squid / Vector"[^>]*>(.*?)</DOMLayer>', dom, re.S)
+    assert squid and "DOMShape" in squid.group(1)
+
+
+def test_all_domlayers_have_contiguous_frames(tmp_path):
+    """Every layer's frames start at 0 with no gaps (Animate rejects gaps)."""
+    z, _ = _dom(tmp_path)
+    dom = z.read("DOMDocument.xml").decode()
+    for layer in re.findall(r"<DOMLayer[^>]*>(.*?)</DOMLayer>", dom, re.S):
+        indices = [int(i) for i in re.findall(r'index="(-?\d+)"', layer)]
+        assert indices and indices[0] == 0
+        assert indices == list(range(len(indices)))
+
+
+def test_text_uses_characters_element_and_face(tmp_path):
+    z, _ = _dom(tmp_path)
+    dom = z.read("DOMDocument.xml").decode()
+    assert "<characters>Hello</characters>" in dom
+    assert 'face="_sans"' in dom
+    assert 'bold="true"' in dom
+    assert 'size="40"' in dom
+    # No bogus legacy attributes.
+    assert "DOMTextRun characters=" not in dom
+    assert 'face="Regular"' not in dom
+
+
+def test_bitmap_dat_header_has_twip_dimensions(tmp_path):
+    z, _ = _dom(tmp_path)
+    name = next(n for n in z.namelist() if n.startswith("bin/M "))
+    dat = z.read(name)
+    width = int.from_bytes(dat[4:6], "little")
+    height = int.from_bytes(dat[6:8], "little")
+    assert int.from_bytes(dat[12:16], "little") == width * 20
+    assert int.from_bytes(dat[20:24], "little") == height * 20
+
+
+def test_symbol_instance_carries_transform(tmp_path):
+    """The inlined symbol layer keeps its placement transform."""
+    z, _ = _dom(tmp_path)
+    dom = z.read("DOMDocument.xml").decode()
+    # Pixel layer placed at (300, 100) must appear as a bitmap instance matrix.
+    assert "DOMBitmapInstance" in dom

@@ -49,7 +49,11 @@ def _strip_relative_imports(source: str) -> str:
 
 
 def build_single_file() -> Path:
-    parts = [HEADER.format(version=_version()), "from __future__ import annotations\n"]
+    parts = [
+        HEADER.format(version=_version()),
+        "from __future__ import annotations\n",
+        f'__version__ = "{_version()}"\n',
+    ]
     for name in MODULE_ORDER:
         src = (PACKAGE / f"{name}.py").read_text()
         parts.append(f"\n# ===== tsproj2fla.{name} =====\n")

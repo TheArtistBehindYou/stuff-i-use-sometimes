@@ -26,7 +26,7 @@ import uuid
 import zipfile
 from dataclasses import dataclass, field
 from typing import Any
-from xml.sax.saxutils import quoteattr
+from xml.sax.saxutils import escape, quoteattr
 
 from PIL import Image
 
@@ -119,6 +119,17 @@ class Matrix:
 
     def apply(self, x: float, y: float) -> tuple[float, float]:
         return (self.a * x + self.c * y + self.tx, self.b * x + self.d * y + self.ty)
+
+    def multiply(self, other: "Matrix") -> "Matrix":
+        """Return ``self * other`` (apply ``other`` first, then ``self``)."""
+        return Matrix(
+            a=self.a * other.a + self.c * other.b,
+            b=self.b * other.a + self.d * other.b,
+            c=self.a * other.c + self.c * other.d,
+            d=self.b * other.c + self.d * other.d,
+            tx=self.a * other.tx + self.c * other.ty + self.tx,
+            ty=self.b * other.tx + self.d * other.ty + self.ty,
+        )
 
 
 def transform_matrix(layer_json: dict[str, Any], frame: int) -> tuple[Matrix, tuple[float, float]]:
@@ -318,7 +329,9 @@ def _solid_color_value(track: Any, frame: int) -> tuple[str, float] | None:
 # --------------------------------------------------------------------------- #
 # XFL element builders
 # --------------------------------------------------------------------------- #
-def build_vector_element(layer_json: dict[str, Any], frame: int) -> str:
+def build_vector_element(
+    layer_json: dict[str, Any], frame: int, parent_matrix: Matrix | None = None
+) -> str:
     keys = (layer_json.get("p") or {}).get("k")
     if keys is None:
         # 2.x stores the path (subpaths) directly on the layer
@@ -329,6 +342,8 @@ def build_vector_element(layer_json: dict[str, Any], frame: int) -> str:
     if not isinstance(key_value, dict):
         return ""
     matrix, _pivot = transform_matrix(layer_json, frame)
+    if parent_matrix is not None:
+        matrix = parent_matrix.multiply(matrix)
     # ToonSquid paths are in absolute canvas coordinates; the layer transform
     # (which already folds in the pivot) places them, so no pivot subtraction.
     fill = _solid_color_value(layer_json.get("fC"), frame)
@@ -378,9 +393,12 @@ def build_bitmap_element(
     frame: int,
     bitmap_name: str,
     rect: tuple[int, int, int, int],
+    parent_matrix: Matrix | None = None,
 ) -> str:
     x, y, _w, _h = rect
     matrix, _ = transform_matrix(layer_json, frame)
+    if parent_matrix is not None:
+        matrix = parent_matrix.multiply(matrix)
     # The bitmap covers the absolute canvas rect (x, y, w, h); the layer transform
     # is applied around the rect's centre, so push the rect's top-left through it.
     tx, ty = matrix.apply(x, y)
@@ -393,20 +411,67 @@ def build_bitmap_element(
     )
 
 
-def build_text_element(layer_json: dict[str, Any], frame: int) -> str:
+def build_text_element(
+    layer_json: dict[str, Any], frame: int, parent_matrix: Matrix | None = None
+) -> str:
     text = layer_json.get("t") or ""
     if not text:
         return ""
     matrix, _ = transform_matrix(layer_json, frame)
+    if parent_matrix is not None:
+        matrix = parent_matrix.multiply(matrix)
     color, _ = _color_hex(layer_json.get("co") or {"r": 0, "g": 0, "b": 0, "a": 1})
-    size = float(layer_json.get("fS") or 12) / TWIPS
+    # fS is a font size in points (not twips); lBW is the line-box width in px.
+    size = float(layer_json.get("fS") or 12)
+    face, attrs = _font_face(str(layer_json.get("fN") or ""))
+    width = float(layer_json.get("lBW") or 0.0)
+    if width <= 0:
+        width = max(len(text) * size * 0.6, size)
+    height = size * 1.4
+    align = {0: "left", 1: "center", 2: "right"}.get(int(layer_json.get("al") or 0), "left")
+    alignment = f' alignment="{align}"' if align != "left" else ""
+    # Real XFL stores the string in a <characters> child element (not an
+    # attribute) and identifies the font by `face`.
     return (
-        "<DOMStaticText>"
+        f'<DOMStaticText width="{_fmt(width)}" height="{_fmt(height)}">'
         f"<matrix>{matrix.to_xml()}</matrix>"
-        f'<textRuns><DOMTextRun characters={quoteattr(text)}>'
-        f'<textAttrs><DOMTextAttrs aliasText="false" size="{_fmt(size)}" '
-        f'fillColor="{color}"/></textAttrs></DOMTextRun></textRuns>'
+        "<textRuns><DOMTextRun>"
+        f"<characters>{escape(text)}</characters>"
+        f'<textAttrs><DOMTextAttrs{alignment} aliasText="false" autoKern="false" '
+        f'size="{_fmt(size)}" bitmapSize="{_fmt(size * TWIPS)}" face={quoteattr(face)} '
+        f'fillColor="{color}"{attrs}/></textAttrs>'
+        "</DOMTextRun></textRuns>"
+        f'<bounds>{_rect_xml(width, height)}</bounds>'
         "</DOMStaticText>"
+    )
+
+
+def _font_face(font: str) -> tuple[str, str]:
+    """Split a ToonSquid ``fN`` name into an XFL ``face`` and extra attrs.
+
+    ToonSquid often stores generic names such as ``System Font SemiBold``; those
+    map to the ``_sans`` device font, with the weight carried in ``bold``.
+    """
+    if not font:
+        return "_sans", ""
+    low = font.lower()
+    bold = any(w in low for w in ("bold", "black", "heavy", "semibold", "medium"))
+    italic = "italic" in low or "oblique" in low
+    if "system font" in low or low in {"system", "system font"}:
+        face = "_sans"
+    else:
+        face = font
+    extra = ' bold="true"' if bold else ""
+    if italic:
+        extra += ' italic="true"'
+    return face, extra
+
+
+def _rect_xml(width: float, height: float) -> str:
+    right = _fmt(width * TWIPS)
+    bottom = _fmt(height * TWIPS)
+    return (
+        f'<Rectangle left="0" top="0" right="{right}" bottom="{bottom}"/>'
     )
 
 
@@ -417,7 +482,6 @@ def build_text_element(layer_json: dict[str, Any], frame: int) -> str:
 class Converter:
     project: Project
     reverse_layers: bool = True
-    symbol_names: dict[str, str] = field(default_factory=dict)
     texture_map: dict[str, tuple[str, tuple[int, int, int, int]]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     current_clip: Clip | None = None
@@ -430,9 +494,8 @@ class Converter:
     def item_id(self, key: str) -> str:
         """Stable library itemID for a given key.
 
-        The <Include> in DOMDocument.xml and the DOMSymbolItem/DOMBitmapItem
-        must carry the *same* itemID or Animate cannot resolve the library
-        item, and the document opens with an empty stage.
+        The DOMBitmapItem in DOMDocument.xml and the media it points at must
+        carry a consistent itemID or Animate cannot resolve the library item.
         """
         if key not in self._item_ids:
             self._item_counter += 1
@@ -444,98 +507,128 @@ class Converter:
             self._bitmap_names[texture_id] = f"ts_{texture_id[:8]}"
         return self._bitmap_names[texture_id]
 
-    def symbol_name(self, clip_id: str) -> str:
-        if clip_id not in self.symbol_names:
-            clip = self.project.clips.get(clip_id)
-            base = clip.name if clip else clip_id[:8]
-            safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in base).strip() or "Clip"
-            name = safe
-            n = 2
-            while name in self.symbol_names.values():
-                name = f"{safe} {n}"
-                n += 1
-            self.symbol_names[clip_id] = name
-        return self.symbol_names[clip_id]
-
     def layer_color(self, index: int) -> str:
         return LAYER_COLORS[index % len(LAYER_COLORS)]
 
     # -- drawing layer -> element ---------------------------------------- #
-    def drawing_layer_element(self, layer_id: str, frame: int) -> str:
+    def drawing_layer_element(
+        self, layer_id: str, frame: int, parent_matrix: Matrix | None = None
+    ) -> str:
         assert self.current_clip is not None
         ltype = self.current_clip.layer_type(layer_id)
         layer_json = self.current_clip.layers.get(layer_id, {})
         if ltype in (LT_VECTOR, LT_SHAPE):
-            return build_vector_element(layer_json, frame)
+            return build_vector_element(layer_json, frame, parent_matrix)
         if ltype == LT_PIXEL:
             entry = self.texture_map.get(layer_id)
             if entry is None or entry[0] not in self.project.textures:
                 return ""
             texture_id, rect = entry
-            return build_bitmap_element(layer_json, frame, self.bitmap_name(texture_id), rect)
+            return build_bitmap_element(
+                layer_json, frame, self.bitmap_name(texture_id), rect, parent_matrix
+            )
         if ltype == LT_TEXT:
-            return build_text_element(layer_json, frame)
+            return build_text_element(layer_json, frame, parent_matrix)
         if ltype == LT_SYMBOL:
-            return self.symbol_instance(layer_id, frame)
+            # The user wants flat layers, not movie clips: inline the referenced
+            # clip's content directly instead of emitting a DOMSymbolInstance.
+            return self.flatten_symbol_layer(layer_id, frame, parent_matrix)
         if ltype == LT_GROUP:
             return "".join(
-                p for p in (self.drawing_layer_element(c, frame) for c in layer_json.get("ch", [])) if p
+                p
+                for p in (
+                    self.drawing_layer_element(c, frame, parent_matrix)
+                    for c in layer_json.get("ch", [])
+                )
+                if p
             )
         return ""
 
-    def symbol_instance(self, layer_id: str, frame: int) -> str:
+    def symbol_layer_matrix(self, layer_id: str, frame: int) -> Matrix:
+        """The placement transform of a symbol layer at ``frame``."""
         assert self.current_clip is not None
         layer_json = self.current_clip.layers.get(layer_id, {})
-        ref = layer_json.get("cl") or {}
+        matrix, _ = transform_matrix(layer_json, frame)
+        return matrix
+
+    def symbol_target(self, layer_id: str) -> str | None:
+        assert self.current_clip is not None
+        ref = self.current_clip.layers.get(layer_id, {}).get("cl") or {}
         clip_id = ref.get("id") if isinstance(ref, dict) else None
         if not clip_id or clip_id not in self.project.clips:
+            return None
+        return clip_id
+
+    def flatten_symbol_layer(
+        self, layer_id: str, frame: int, parent_matrix: Matrix | None = None
+    ) -> str:
+        clip_id = self.symbol_target(layer_id)
+        if clip_id is None:
             return ""
         if clip_id in self._symbol_stack:
             self.warnings.append(f"recursive symbol {clip_id} skipped")
             return ""
-        matrix, _ = transform_matrix(layer_json, frame)
-        return (
-            f'<DOMSymbolInstance libraryItemName={quoteattr(self.symbol_name(clip_id))} '
-            'symbolType="movie clip" loop="loop">'
-            f"<matrix>{matrix.to_xml()}</matrix>"
-            "<transformationPoint><Point/></transformationPoint>"
-            "</DOMSymbolInstance>"
-        )
+        placement = self.symbol_layer_matrix(layer_id, frame)
+        if parent_matrix is not None:
+            placement = parent_matrix.multiply(placement)
+        child = self.project.clips[clip_id]
+        self._symbol_stack.append(clip_id)
+        try:
+            return "".join(self.clip_elements(child, frame, placement))
+        finally:
+            self._symbol_stack.pop()
 
     # -- animation layer -> DOMLayer ------------------------------------- #
-    def _layer_spans(self, layer_id: str) -> list[tuple[int, int, str]]:
+    def _layer_spans(
+        self, clip: Clip, layer_id: str, parent_matrix: Matrix | None = None
+    ) -> list[tuple[int, int, str]]:
         """Return ``(start_index, duration, elements)`` spans for a layer."""
-        assert self.current_clip is not None
-        layer_json = self.current_clip.layers.get(layer_id, {})
-        ltype = self.current_clip.layer_type(layer_id)
-        total = max(self.current_clip.total_frames, 1)
+        prev = self.current_clip
+        self.current_clip = clip
+        try:
+            layer_json = clip.layers.get(layer_id, {})
+            ltype = clip.layer_type(layer_id)
+            total = max(clip.total_frames, 1)
 
-        if ltype in (LT_SYMBOL, LT_VECTOR, LT_PIXEL, LT_TEXT, LT_SHAPE):
-            return [(0, total, self.drawing_layer_element(layer_id, 0))]
+            if ltype in (LT_SYMBOL, LT_VECTOR, LT_PIXEL, LT_TEXT, LT_SHAPE):
+                return [(0, total, self.drawing_layer_element(layer_id, 0, parent_matrix))]
 
-        spans: list[tuple[int, int, str]] = []
-        for drawing_id in layer_json.get("dr", []):
-            drawing = self.current_clip.drawings.get(drawing_id)
-            if not drawing:
-                continue
-            start = max(int(drawing.get("s", 1)) - 1, 0)
-            end = max(int(drawing.get("e", start + 1)), start + 1)
-            parts = [self.drawing_layer_element(child, start) for child in drawing.get("ly", [])]
-            spans.append((start, end - start, "".join(p for p in parts if p)))
-        if not spans:
-            spans = [(0, total, "")]
-        spans.sort(key=lambda s: s[0])
-        return spans
+            spans: list[tuple[int, int, str]] = []
+            for drawing_id in layer_json.get("dr", []):
+                drawing = clip.drawings.get(drawing_id)
+                if not drawing:
+                    continue
+                start = max(int(drawing.get("s", 1)) - 1, 0)
+                end = max(int(drawing.get("e", start + 1)), start + 1)
+                parts = [
+                    self.drawing_layer_element(child, start, parent_matrix)
+                    for child in drawing.get("ly", [])
+                ]
+                spans.append((start, end - start, "".join(p for p in parts if p)))
+            if not spans:
+                spans = [(0, total, "")]
+            spans.sort(key=lambda s: s[0])
+            return spans
+        finally:
+            self.current_clip = prev
 
-    def _dom_layer(self, layer_id: str, color_index: int) -> str:
-        assert self.current_clip is not None
-        ltype = self.current_clip.layer_type(layer_id)
+    def _dom_layer(
+        self,
+        clip: Clip,
+        layer_id: str,
+        color_index: int,
+        name: str | None = None,
+        parent_matrix: Matrix | None = None,
+    ) -> str:
+        ltype = clip.layer_type(layer_id)
         if ltype in (LT_CAMERA, LT_AUDIO, LT_EFFECT, LT_SCROLL, LT_BACKGROUND):
             return ""
-        layer_json = self.current_clip.layers.get(layer_id, {})
-        name = layer_json.get("Na") or "Layer"
-        spans = self._layer_spans(layer_id)
-        if not spans:
+        layer_json = clip.layers.get(layer_id, {})
+        name = name or layer_json.get("Na") or "Layer"
+        spans = self._layer_spans(clip, layer_id, parent_matrix)
+        if not spans or not any(elements for _start, _duration, elements in spans):
+            # Nothing drawable on this layer; drop it so the timeline is not
+            # littered with the empty helper layers ToonSquid leaves behind.
             return ""
         current = ' current="true" isSelected="true"' if color_index == 0 else ""
         frames = []
@@ -557,31 +650,61 @@ class Converter:
             "</DOMLayer>"
         )
 
-    # -- clip -> DOMTimeline --------------------------------------------- #
-    def clip_timeline(self, clip: Clip, name: str) -> str:
+    def _background_layer(self, name: str, frames: int) -> str:
+        """A plain background layer spanning the timeline."""
+        return (
+            f'<DOMLayer name={quoteattr(name)} color="#C0C0C0">'
+            f'<frames><DOMFrame index="0" duration="{max(frames, 1)}" keyMode="9728">'
+            "<elements/></DOMFrame></frames></DOMLayer>"
+        )
+
+    def clip_elements(
+        self, clip: Clip, frame: int, parent_matrix: Matrix | None = None
+    ) -> list[str]:
+        """Every drawable element of ``clip`` (used when inlining a symbol).
+
+        Animation layers are expanded through ``_layer_spans`` so their drawings
+        (which may hold pixel/vector/symbol children) survive the flattening.
+        """
         prev = self.current_clip
         self.current_clip = clip
         try:
-            order = list(reversed(clip.layer_order)) if self.reverse_layers else list(clip.layer_order)
-            layers_xml: list[str] = []
-            color_index = 0
-            for lid in order:
-                if clip.layer_type(lid) == LT_GROUP:
-                    for child in clip.layers.get(lid, {}).get("ch", []):
-                        xml = self._dom_layer(child, color_index)
-                        if xml:
-                            layers_xml.append(xml)
-                            color_index += 1
+            out: list[str] = []
+            for lid in reversed(clip.layer_order) if self.reverse_layers else clip.layer_order:
+                ltype = clip.layer_type(lid)
+                if ltype in (LT_CAMERA, LT_AUDIO, LT_EFFECT, LT_SCROLL, LT_BACKGROUND):
                     continue
-                xml = self._dom_layer(lid, color_index)
-                if xml:
-                    layers_xml.append(xml)
-                    color_index += 1
+                if ltype == LT_GROUP:
+                    for child in clip.layers.get(lid, {}).get("ch", []):
+                        out.extend(self._elements_for_layer(clip, child, parent_matrix))
+                    continue
+                out.extend(self._elements_for_layer(clip, lid, parent_matrix))
+            return out
+        finally:
+            self.current_clip = prev
 
+    def _elements_for_layer(
+        self, clip: Clip, layer_id: str, parent_matrix: Matrix | None = None
+    ) -> list[str]:
+        spans = self._layer_spans(clip, layer_id, parent_matrix)
+        return [el for _start, _duration, el in spans if el]
+
+    def clip_layer_specs(
+        self, clip: Clip, prefix: str = ""
+    ) -> list[tuple[str, str]]:
+        """``(name, layer_id)`` pairs for the clip's drawable layers."""
+        return [(name, lid) for name, _owner, lid, _ in self._layer_specs(clip, prefix, None)]
+
+    # -- clip -> DOMTimeline --------------------------------------------- #
+    def clip_timeline(self, clip: Clip, name: str, scene: bool = False) -> str:
+        prev = self.current_clip
+        self.current_clip = clip
+        try:
+            layers_xml = self._build_layers(clip, scene=scene)
             if not layers_xml:
                 layers_xml.append(
                     '<DOMLayer name="Layer 1" color="#4FFF4F" current="true" isSelected="true">'
-                    '<frames><DOMFrame index="0" keyMode="9728"><elements/></DOMFrame></frames>'
+                    '<frames><DOMFrame index="0" duration="1" keyMode="9728"><elements/></DOMFrame></frames>'
                     "</DOMLayer>"
                 )
             return (
@@ -592,24 +715,66 @@ class Converter:
         finally:
             self.current_clip = prev
 
-    # -- symbol library --------------------------------------------------- #
-    def referenced_clips(self) -> list[str]:
-        return list(self.symbol_names.keys())
+    def _build_layers(self, clip: Clip, scene: bool = False) -> list[str]:
+        """Flat ``DOMLayer`` list for ``clip``.
 
-    def library_symbol_xml(self, clip_id: str) -> str:
-        name = self.symbol_name(clip_id)
-        self._symbol_stack.append(clip_id)
+        Nested symbol/movieclip layers are expanded into their own layers so the
+        result is a plain layer stack rather than a tree of symbols.
+        """
+        layers_xml: list[str] = []
+        color_index = 0
+        for name, owner, lid, parent in self._layer_specs(clip, "", None):
+            xml = self._dom_layer(owner, lid, color_index, name, parent)
+            if xml:
+                layers_xml.append(xml)
+                color_index += 1
+        if scene:
+            layers_xml.append(self._background_layer("Background", max(clip.total_frames, 1)))
+        return layers_xml
+
+    def _layer_specs(
+        self,
+        clip: Clip,
+        prefix: str,
+        parent: Matrix | None,
+    ) -> list[tuple[str, Clip, str, Matrix | None]]:
+        """``(name, owner_clip, layer_id, parent_matrix)`` for drawable layers."""
+        specs: list[tuple[str, Clip, str, Matrix | None]] = []
+        prev = self.current_clip
+        self.current_clip = clip
         try:
-            timeline = self.clip_timeline(self.project.clips[clip_id], name)
+            order = list(reversed(clip.layer_order)) if self.reverse_layers else list(clip.layer_order)
+            for lid in order:
+                ltype = clip.layer_type(lid)
+                if ltype in (LT_CAMERA, LT_AUDIO, LT_EFFECT, LT_SCROLL, LT_BACKGROUND):
+                    continue
+                name = clip.layers.get(lid, {}).get("Na") or "Layer"
+                full = f"{prefix}{name}"
+                if ltype == LT_GROUP:
+                    for child in clip.layers.get(lid, {}).get("ch", []):
+                        specs.append((full, clip, child, parent))
+                elif ltype == LT_SYMBOL:
+                    clip_id = self.symbol_target(lid)
+                    if clip_id is None or clip_id in self._symbol_stack:
+                        if clip_id in self._symbol_stack:
+                            self.warnings.append(f"recursive symbol {clip_id} skipped")
+                        continue
+                    placement = self.symbol_layer_matrix(lid, 0)
+                    if parent is not None:
+                        placement = parent.multiply(placement)
+                    child_clip = self.project.clips[clip_id]
+                    self._symbol_stack.append(clip_id)
+                    try:
+                        specs.extend(
+                            self._layer_specs(child_clip, prefix=f"{full} / ", parent=placement)
+                        )
+                    finally:
+                        self._symbol_stack.pop()
+                else:
+                    specs.append((full, clip, lid, parent))
+            return specs
         finally:
-            self._symbol_stack.pop()
-        return (
-            '<DOMSymbolItem xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
-            f'xmlns="{XFL_NS}" name={quoteattr(name)} itemID="{self.item_id("sym:" + clip_id)}" '
-            'symbolType="movie clip">'
-            f"<timeline>{timeline}</timeline>"
-            "</DOMSymbolItem>"
-        )
+            self.current_clip = prev
 
 
 def build_texture_map(project: Project) -> dict[str, tuple[str, tuple[int, int, int, int]]]:
@@ -628,32 +793,13 @@ def build_texture_map(project: Project) -> dict[str, tuple[str, tuple[int, int, 
         handle.close()
 
 
-def collect_symbols(converter: Converter) -> None:
-    seen: set[str] = set()
-
-    def walk(clip: Clip) -> None:
-        for lid, ltype in clip.layer_types.items():
-            if ltype != LT_SYMBOL:
-                continue
-            ref = clip.layers.get(lid, {}).get("cl") or {}
-            cid = ref.get("id") if isinstance(ref, dict) else None
-            if cid and cid in converter.project.clips and cid not in seen:
-                seen.add(cid)
-                converter.symbol_name(cid)
-                walk(converter.project.clips[cid])
-
-    for clip in converter.project.clips.values():
-        walk(clip)
-
-
 def convert(project: Project, reverse_layers: bool = True) -> tuple[bytes, list[str]]:
     """Convert a parsed project into ``.fla`` bytes.  Returns ``(bytes, warnings)``."""
     converter = Converter(project=project, reverse_layers=reverse_layers)
     converter.texture_map = build_texture_map(project)
-    collect_symbols(converter)
 
     scenes = project.scenes or list(project.clips.values())
-    timelines = [converter.clip_timeline(clip, clip.name) for clip in scenes]
+    timelines = [converter.clip_timeline(clip, clip.name, scene=True) for clip in scenes]
 
     width = project.width or (scenes[0].width if scenes else 550)
     height = project.height or (scenes[0].height if scenes else 400)
@@ -670,15 +816,13 @@ def convert(project: Project, reverse_layers: bool = True) -> tuple[bytes, list[
             f'<DOMBitmapItem name={quoteattr(name)} itemID="{converter.item_id("bmp:" + texture_id)}" '
             'allowSmoothing="true" useImportedJPEGData="false" compressionType="lossless" '
             'originalCompressionType="lossless" quality="50" '
-            f'href={quoteattr(name + ".png")} bitmapDataHRef={quoteattr("M " + name + " 0.dat")} '
+            f'href={quoteattr(name + ".png")} '
+            f'sourceExternalFilepath={quoteattr(".\\LIBRARY\\" + name + ".png")} '
+            f'bitmapDataHRef={quoteattr("M " + name + " 0.dat")} '
             f'frameRight="{w * TWIPS}" frameBottom="{h * TWIPS}"/>'
         )
 
-    symbols_xml = [
-        f'<Include href={quoteattr(converter.symbol_name(cid) + ".xml")} '
-        f'itemID="{converter.item_id("sym:" + cid)}"/>'
-        for cid in converter.referenced_clips()
-    ]
+    symbols_xml = []  # symbols are flattened into layers, not emitted as clips
 
     dom = (
         '<DOMDocument xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
@@ -710,9 +854,6 @@ def convert(project: Project, reverse_layers: bool = True) -> tuple[bytes, list[
         zf.writestr("PublishSettings.xml", _publish_settings(width, height, fps))
         zf.writestr("MobileSettings.xml", "")
         zf.writestr("META-INF/metadata.xml", _metadata_xml())
-
-        for clip_id in converter.referenced_clips():
-            zf.writestr(f"LIBRARY/{converter.symbol_name(clip_id)}.xml", converter.library_symbol_xml(clip_id))
 
         for texture_id in used_textures:
             if texture_id not in project.textures:
@@ -749,6 +890,8 @@ def _encode_dat_bitmap(width: int, height: int, rgba: bytes) -> bytes:
     header[2:4] = (width * 4).to_bytes(2, "little")
     header[4:6] = width.to_bytes(2, "little")
     header[6:8] = height.to_bytes(2, "little")
+    header[12:16] = (width * 20).to_bytes(4, "little")  # frameRight, twips
+    header[20:24] = (height * 20).to_bytes(4, "little")  # frameBottom, twips
     header[24] = 1  # hasAlpha
     header[25] = 0  # variant 0: verbatim A,R,G,B pixel plane
 

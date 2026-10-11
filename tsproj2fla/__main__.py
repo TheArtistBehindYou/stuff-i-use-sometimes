@@ -5,10 +5,9 @@ import argparse
 import sys
 from pathlib import Path
 
+from . import __version__
 from .converter import convert
 from .tsproj import load_project
-
-__version__ = "0.2.1"
 
 
 def main(argv: list[str] | None = None) -> int:
