@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tsproj2fla - convert ToonSquid (.tsproj) projects to Adobe Animate (.fla).
 
-Single-file build, version 0.3.0. Requires only: lz4, Pillow.
+Single-file build, version 0.3.0. Requires only: lz4.
 
 Usage:
     python tsproj2fla.py INPUT.tsproj [-o OUTPUT.fla] [--list]
@@ -31,7 +31,13 @@ how the encoder gets long-distance matches across block boundaries.
 
 import struct
 
-import lz4.block
+try:  # lz4 is only needed to decode textures; keep the failure message clear.
+    import lz4.block
+except ImportError as _exc:  # pragma: no cover - exercised by the launchers
+    lz4 = None
+    _LZ4_IMPORT_ERROR = _exc
+else:
+    _LZ4_IMPORT_ERROR = None
 
 MAGIC = b"DVTX"
 BLOCK_MAGIC = b"bv41"
@@ -43,6 +49,11 @@ class DvtxError(ValueError):
 
 
 def _decompress_block(payload: bytes, out_len: int, dictionary: bytes | None) -> bytes:
+    if lz4 is None:
+        raise DvtxError(
+            "the 'lz4' package is required to decode ToonSquid textures; "
+            "install it with:  pip install lz4"
+        ) from _LZ4_IMPORT_ERROR
     kwargs = {"uncompressed_size": out_len}
     if dictionary:
         kwargs["dict"] = dictionary
@@ -328,14 +339,14 @@ documented approximations.
 
 import io
 import math
+import struct
 import time
 import uuid
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from typing import Any
 from xml.sax.saxutils import escape, quoteattr
-
-from PIL import Image
 
 
 
@@ -1169,10 +1180,7 @@ def convert(project: Project, reverse_layers: bool = True) -> tuple[bytes, list[
             name = converter.bitmap_name(texture_id)
             # LIBRARY/*.png is the preview bitmap Animate shows; bin/M *.dat is
             # the actual bitmap data, stored as an uncompressed pixel plane.
-            img = Image.frombytes("RGBA", (w, h), raw)
-            png = io.BytesIO()
-            img.save(png, format="PNG")
-            zf.writestr(f"LIBRARY/{name}.png", png.getvalue())
+            zf.writestr(f"LIBRARY/{name}.png", _encode_png(w, h, raw))
             zf.writestr(
                 zipfile.ZipInfo(f"bin/M {name} 0.dat"),
                 _encode_dat_bitmap(w, h, raw),
@@ -1180,6 +1188,37 @@ def convert(project: Project, reverse_layers: bool = True) -> tuple[bytes, list[
             )
 
     return buf.getvalue(), converter.warnings
+
+
+def _png_chunk(tag: bytes, payload: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(payload))
+        + tag
+        + payload
+        + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+    )
+
+
+def _encode_png(width: int, height: int, rgba: bytes) -> bytes:
+    """Encode an RGBA buffer as a PNG (pure Python, no Pillow).
+
+    Only used for the ``LIBRARY/*.png`` preview Animate shows; the real bitmap
+    data lives in ``bin/M *.dat``.
+    """
+    stride = width * 4
+    # Each scanline is prefixed with a filter byte (0 = None).
+    raw = bytearray(height * (stride + 1))
+    for y in range(height):
+        src = y * stride
+        dst = y * (stride + 1)
+        raw[dst + 1:dst + 1 + stride] = rgba[src:src + stride]
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + _png_chunk(b"IEND", b"")
+    )
 
 
 def _encode_dat_bitmap(width: int, height: int, rgba: bytes) -> bytes:
@@ -1319,6 +1358,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Clips   : {len(project.clips)}")
     print(f"Textures: {len(project.textures)}")
     print(f"Audio   : {len(project.audio)}")
+    seen: set[str] = set()
+    for warning in project.warnings:
+        if warning not in seen:
+            seen.add(warning)
+            print(f"  warning: {warning}")
 
     if args.list:
         for scene in project.scenes:

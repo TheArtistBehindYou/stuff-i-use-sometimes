@@ -45,6 +45,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Clips   : {len(project.clips)}")
     print(f"Textures: {len(project.textures)}")
     print(f"Audio   : {len(project.audio)}")
+    seen: set[str] = set()
+    for warning in project.warnings:
+        if warning not in seen:
+            seen.add(warning)
+            print(f"  warning: {warning}")
 
     if args.list:
         for scene in project.scenes:

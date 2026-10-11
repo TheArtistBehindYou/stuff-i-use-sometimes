@@ -14,7 +14,13 @@ from __future__ import annotations
 
 import struct
 
-import lz4.block
+try:  # lz4 is only needed to decode textures; keep the failure message clear.
+    import lz4.block
+except ImportError as _exc:  # pragma: no cover - exercised by the launchers
+    lz4 = None
+    _LZ4_IMPORT_ERROR = _exc
+else:
+    _LZ4_IMPORT_ERROR = None
 
 MAGIC = b"DVTX"
 BLOCK_MAGIC = b"bv41"
@@ -26,6 +32,11 @@ class DvtxError(ValueError):
 
 
 def _decompress_block(payload: bytes, out_len: int, dictionary: bytes | None) -> bytes:
+    if lz4 is None:
+        raise DvtxError(
+            "the 'lz4' package is required to decode ToonSquid textures; "
+            "install it with:  pip install lz4"
+        ) from _LZ4_IMPORT_ERROR
     kwargs = {"uncompressed_size": out_len}
     if dictionary:
         kwargs["dict"] = dictionary

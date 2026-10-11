@@ -2,7 +2,7 @@
 
 Produces, under ``dist/``:
 
-* ``tsproj2fla.py``  - a single-file, dependency-light script (needs only lz4+Pillow)
+* ``tsproj2fla.py``  - a single-file, dependency-light script (needs only lz4)
 * ``tsproj2fla.zip`` - the full source tree (package + tests + docs + samples)
 * ``tsproj2fla-<version>-py3-none-any.whl`` and ``.tar.gz`` - installable packages
 
@@ -24,7 +24,7 @@ PACKAGE = ROOT / "tsproj2fla"
 HEADER = '''#!/usr/bin/env python3
 """tsproj2fla - convert ToonSquid (.tsproj) projects to Adobe Animate (.fla).
 
-Single-file build, version {version}. Requires only: lz4, Pillow.
+Single-file build, version {version}. Requires only: lz4.
 
 Usage:
     python tsproj2fla.py INPUT.tsproj [-o OUTPUT.fla] [--list]

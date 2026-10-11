@@ -4,8 +4,8 @@ REM
 REM Drag one or more ToonSquid .tsproj files onto this file to convert them to
 REM Adobe Animate .fla. The window stays open so you can read the results.
 REM
-REM On first run it installs the two Python libraries the converter needs
-REM (Pillow and lz4), so you do not have to run pip yourself.
+REM On first run it installs the one Python library the converter needs
+REM (lz4), so you do not have to run pip yourself.
 REM
 REM It looks for tsproj2fla.py beside this file, then in ..\dist\, then falls
 REM back to an installed 'tsproj2fla' command.
@@ -49,19 +49,19 @@ if not defined PY (
 REM --- make sure the two required libraries are present -----------------
 "%PY%" -c "import PIL, lz4" >nul 2>nul
 if errorlevel 1 (
-    echo Installing required libraries ^(Pillow, lz4^). This happens once...
-    "%PY%" -m pip install --quiet --disable-pip-version-check pillow lz4
+    echo Installing the required library ^(lz4^). This happens once...
+    "%PY%" -m pip install --quiet --disable-pip-version-check lz4
     "%PY%" -c "import PIL, lz4" >nul 2>nul
     if errorlevel 1 (
         echo.
-        echo Could not install Pillow/lz4 automatically.
+        echo Could not install lz4 automatically.
         echo Please run this command, then try again:
         echo.
-        echo     "%PY%" -m pip install pillow lz4
+        echo     "%PY%" -m pip install lz4
         echo.
         goto :end
     )
-    echo Libraries installed.
+    echo Library installed.
     echo.
 )
 

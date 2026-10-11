@@ -1,6 +1,6 @@
 """Build a standalone tsproj2fla executable with PyInstaller.
 
-The result bundles Python plus the Pillow and lz4 libraries, so end users can
+The result bundles Python plus the lz4 library, so end users can
 run it with nothing installed. It must be run on the target operating system:
 PyInstaller cannot cross-compile (build the Windows .exe on Windows).
 
@@ -56,8 +56,6 @@ def main() -> int:
         str(ROOT / "build" / "pyinstaller"),
         "--specpath",
         str(ROOT / "build"),
-        "--collect-all",
-        "PIL",
         "--collect-all",
         "lz4",
         str(entry),

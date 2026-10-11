@@ -97,3 +97,34 @@ symbols + `LIBRARY/*.png` bitmaps, `bin/M <name> 0.dat` bitmap data.
   colour premultiplied by alpha (stored alpha is `a+1` for partial alpha; see
   JPEXS `LosslessImageBinDataReader`). `variant=0` with exactly `w*h*4` payload
   bytes is read as a verbatim pixel plane. Store it uncompressed.
+
+## Flattening symbols into layers
+
+The output is deliberately a **flat layer stack**, not a tree of movie-clip
+symbols: symbol layers are expanded into their own `DOMLayer`s so the animation
+is visible on the timeline instead of hidden in the library. Consequences:
+
+- `_layer_specs` returns `(name, owner_clip, layer_id, parent_matrix)`; the
+  **owning clip travels with each layer**. Resolving a layer against
+  `self.current_clip` instead of its owner silently yields empty elements for
+  everything inlined from a symbol.
+- `_layer_spans` takes the owning `Clip` explicitly (it swaps `current_clip`
+  internally) so nested symbol/anim layers resolve correctly.
+- Layers that render nothing are dropped — ToonSquid leaves many empty helper
+  layers (grids, easing-curve holders, groups) that otherwise litter the
+  timeline.
+- Placement matrices compose: `parent.multiply(placement)`.
+
+## Dependencies
+
+`lz4` is the **only** third-party dependency (DVTX texture decompression).
+`LIBRARY/*.png` previews are written by a pure-Python PNG encoder
+(`_encode_png`), so Pillow is not needed. A missing `lz4` raises a clear
+`DvtxError` per texture (surfaced as a warning) instead of a bare
+`ModuleNotFoundError`. `lz4` is imported inside `try/except ImportError`.
+
+## Versioning
+
+`__version__` lives in `tsproj2fla/__init__.py` and `pyproject.toml`; keep them
+in sync. `__main__.py` imports it from the package. `tools/build_dist.py`
+injects it into the single-file build.

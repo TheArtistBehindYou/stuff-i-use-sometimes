@@ -36,7 +36,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pillow lz4 pyinstaller
+          pip install lz4 pyinstaller
 
       - name: Build executable
         run: python tools/build_exe.py

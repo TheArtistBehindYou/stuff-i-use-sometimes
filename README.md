@@ -12,7 +12,7 @@ re-saved as a compressed `.fla`.
 ## Install
 
 ```bash
-pip install -r requirements.txt      # lz4 + pillow
+pip install -r requirements.txt      # lz4 (only dependency)
 pip install -e .                     # optional: installs the `tsproj2fla` command
 ```
 
@@ -26,13 +26,14 @@ Everything in [`dist/`](dist/) is ready to use:
 | --- | --- | --- |
 | `dist/tsproj2fla.py` | Single self-contained script (no install) | `python tsproj2fla.py INPUT.tsproj` |
 | `dist/tsproj2fla.zip` | Full source tree (package, tests, docs) | unzip, then `python -m tsproj2fla ...` |
-| `dist/tsproj2fla-0.1.0-py3-none-any.whl` | Installable package | `pip install dist/*.whl` |
-| `dist/tsproj2fla-0.1.0.tar.gz` | Source distribution | `pip install dist/*.tar.gz` |
+| `dist/tsproj2fla-0.3.0-py3-none-any.whl` | Installable package | `pip install dist/*.whl` |
+| `dist/tsproj2fla-0.3.0.tar.gz` | Source distribution | `pip install dist/*.tar.gz` |
 
-The single-file script and the wheel both need only `lz4` and `Pillow`:
+The single-file script and the wheel both need only `lz4` (for decoding
+textures); everything else uses the standard library:
 
 ```bash
-pip install lz4 pillow
+pip install lz4
 python dist/tsproj2fla.py MyProject.tsproj -o Out.fla
 ```
 
@@ -58,8 +59,8 @@ several `.tsproj` files at once.
 > Gatekeeper may need a right-click → Open to allow it. Linux file managers
 > vary; the `.sh` also works fine from a terminal.
 
-On **Windows**, the launcher installs the two required libraries (Pillow and
-lz4) automatically on first run, so you never have to run `pip` yourself.
+On **Windows**, the launcher installs the required library (`lz4`) automatically
+on first run, so you never have to run `pip` yourself.
 
 ### Standalone executable (nothing to install)
 
@@ -67,7 +68,7 @@ To run with no Python and no dependencies at all, build a single-file
 executable that bundles everything:
 
 ```bash
-pip install pyinstaller pillow lz4
+pip install pyinstaller lz4
 python tools/build_exe.py          # -> dist/tsproj2fla.exe  (Windows)
 ```
 
